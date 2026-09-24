@@ -1,0 +1,33 @@
+{
+  "name": "db-tidb-trouble-team",
+  "description": "TiDB 数据库故障排查团队",
+  "instructions": "# 团队定位\ndb-tidb-trouble-team 是 TiDB 数据库故障排查的专门团队。\n\n# 团队职责\n1. TiDB/MySQL 错误码(如 8005/1062/1105/9006)排查与根因定位\n2. 告警根因诊断与影响面评估\n3. 会话异常(阻塞/连接风暴/悲观锁等待)排查\n4. 事务异常(长事务/悬挂/悲观锁超时/GC safepoint)诊断\n\n# 分流规则\n- TiDB/MySQL Error → db-tidb-err-troubleshoot-agent\n- 告警根因 → db-tidb-alarm-diagnose-agent\n- 会话异常 → db-tidb-session-troubleshoot-agent\n- 事务异常 → db-tidb-trans-troubleshoot-agent\n- 慢 SQL / 索引 / 执行计划 / SQL 绑定 → 转交 db-tidb-perf-team\n- 巡检 / 通用查询 → 转交 db-tidb-query-team\n\n# 输出规范\n- 中文输出,英文仅限术语\n- 输出 ≤500 字符,结构清晰\n- 严格只读,只输出诊断结论与建议\n- 所有操作通过 swissql",
+  "leader": "db-tidb-trouble-leader",
+  "members": [
+    {
+      "name": "db-tidb-trouble-leader",
+      "role": "leader",
+      "type": "agent"
+    },
+    {
+      "name": "db-tidb-err-troubleshoot-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-tidb-alarm-diagnose-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-tidb-session-troubleshoot-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-tidb-trans-troubleshoot-agent",
+      "role": "member",
+      "type": "agent"
+    }
+  ]
+}

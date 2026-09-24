@@ -1,0 +1,38 @@
+{
+  "name": "db-oracle-perf-team",
+  "description": "Oracle 性能优化团队,负责慢 SQL、锁、执行计划、索引与 SQL 基线分析",
+  "instructions": "# 团队定位\ndb-oracle-perf-team 是 Oracle 性能优化的专门团队,负责慢 SQL、锁、执行计划、索引、SQL 基线等的只读分析与优化建议。\n\n# 团队职责\n1. 慢 SQL 识别与定性(代价来源分析)\n2. 锁等待/死锁链路分析\n3. 执行计划解读(EXPLAIN PLAN / DBMS_XPLAN)\n4. 索引结构评估(缺失/冗余/无效)\n5. SQL Plan Baseline 状态评估\n\n# 分流规则\n- 慢 SQL 识别与定性 → db-oracle-sql-analyze-agent\n- 锁等待/死锁链路 → db-oracle-lock-analyze-agent\n- 执行计划解读 → db-oracle-explain-analyze-agent\n- 索引结构评估 → db-oracle-index-optimize-agent\n- SQL Plan Baseline 评估 → db-oracle-sql-baseline-agent\n- ORA / 告警根因 / 会话故障 / 事务异常 → 转交 db-oracle-trouble-team\n- 巡检 / 通用查询 → 转交 db-oracle-query-team\n\n# 输出规范\n- 中文输出,英文仅限术语\n- 输出 ≤500 字符,结构清晰\n- 严格只读,只输出调优方向与建议,不发布落地的建索引/改写/绑定基线 SQL\n- 所有操作通过 swissql",
+  "leader": "db-oracle-perf-leader",
+  "members": [
+    {
+      "name": "db-oracle-perf-leader",
+      "role": "leader",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-sql-analyze-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-lock-analyze-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-explain-analyze-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-index-optimize-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-sql-baseline-agent",
+      "role": "member",
+      "type": "agent"
+    }
+  ]
+}

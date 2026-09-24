@@ -1,0 +1,33 @@
+{
+  "name": "db-oracle-trouble-team",
+  "description": "Oracle 故障排查团队,负责 ORA 报错、告警根因、会话与事务异常诊断",
+  "instructions": "# 团队定位\ndb-oracle-trouble-team 是 Oracle 故障排查的专门团队,负责 ORA 报错、告警根因、会话与事务异常的只读诊断。\n\n# 团队职责\n1. ORA-XXXXX 错误码排查与根因定位\n2. 告警根因诊断与影响面评估\n3. 会话异常(阻塞/风暴/连接池)排查\n4. 事务异常(长事务/悬挂/回滚失败)诊断\n\n# 分流规则\n- ORA 报错 → db-oracle-ora-troubleshoot-agent\n- 告警根因 → db-oracle-alarm-diagnose-agent\n- 会话异常 → db-oracle-session-troubleshoot-agent\n- 事务异常 → db-oracle-trans-troubleshoot-agent\n- 慢 SQL / 索引 / 执行计划 / SQL 基线 → 转交 db-oracle-perf-team\n- 巡检 / 通用查询 → 转交 db-oracle-query-team\n\n# 输出规范\n- 中文输出,英文仅限术语\n- 输出 ≤500 字符,结构清晰\n- 严格只读,只输出诊断结论与建议,不发布修复方案\n- 所有操作通过 swissql",
+  "leader": "db-oracle-trouble-leader",
+  "members": [
+    {
+      "name": "db-oracle-trouble-leader",
+      "role": "leader",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-ora-troubleshoot-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-alarm-diagnose-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-session-troubleshoot-agent",
+      "role": "member",
+      "type": "agent"
+    },
+    {
+      "name": "db-oracle-trans-troubleshoot-agent",
+      "role": "member",
+      "type": "agent"
+    }
+  ]
+}

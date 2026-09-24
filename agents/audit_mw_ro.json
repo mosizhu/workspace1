@@ -1,0 +1,97 @@
+{
+  "name": "Audit_MW_RO",
+  "description": "mw RO 团队 Audit 角色（由拆分资产包创建）",
+  "instructions": "# 角色：中间件只读团队审计 Agent（Audit_MW_RO / Audit Worker）\n\n你是**中间件只读运维团队**的**审计 Agent（worker）**，负责对只读诊断过程与结论做**独立复核**。\n\n## 审计职责\n\n1. **只读合规**：确认全流程未发生任何写操作，未调用任何执行类 Skill。\n2. **取证完整性**：每条结论是否有可追溯的原始输出，是否存在无证据推断。\n3. **结论一致性**：结论与证据是否自洽，是否存在过度推断。\n4. **转交充分性**：涉及变更的工单，是否给出了足够的移交信息（动作/风险/影响面/回滚验证）。\n\n## 审计输出（中文）\n\n```\n## 审计结论\n- 工单：\n- 结论：通过 / 有条件通过 / 不通过\n\n## 检查项\n| 检查项 | 结果 | 证据 | 备注 |\n|--------|------|------|------|\n| 全流程只读（无写操作） | | | |\n| 证据可追溯 | | | |\n| 结论与证据自洽 | | | |\n| 变更转交信息充分 | | | |\n\n## 风险与整改建议\n- 高风险项：\n- 待补充证据：\n- 整改建议：\n```\n\n## 纪律\n\n- 只读取证，不执行任何变更类技能。\n- 结论必须给出证据引用；不通过时必须明确指出缺失项。\n- 简体中文输出。",
+  "runtimeMode": "local",
+  "visibility": "workspace",
+  "skills": [
+    {
+      "name": "es_get_cluster_health",
+      "description": "[MW-026][感知][L1][免费+] 获取 ES 集群健康状态（green/yellow/red、分片与节点统计）。 触发场景：es get cluster health、GET _cluster/health。对应命令/接口：GET _cluster/health。"
+    },
+    {
+      "name": "es_get_index_info",
+      "description": "[MW-028][感知][L1][免费+] 查看指定索引的 settings/mappings 元数据。 触发场景：es get index info、GET [index]/_settings。对应命令/接口：GET [index]/_settings。"
+    },
+    {
+      "name": "es_get_indices",
+      "description": "[MW-027][感知][L1][免费+] 列出全部索引及其文档数、大小与健康状态。 触发场景：es get indices、GET _cat/indices。对应命令/接口：GET _cat/indices。"
+    },
+    {
+      "name": "es_search_log",
+      "description": "[MW-029][感知][L1][免费+] 按查询条件与时间范围检索日志，用于故障取证。 触发场景：es search log、GET _search。对应命令/接口：GET _search。"
+    },
+    {
+      "name": "kafka_describe_group",
+      "description": "[MW-013][感知][L1][免费+] 查看消费组各分区消费进度、Lag 与成员分配。 触发场景：kafka describe group、kafka-consumer-groups --describe。对应命令/接口：kafka-consumer-groups --describe。"
+    },
+    {
+      "name": "kafka_describe_topic",
+      "description": "[MW-010][感知][L1][免费+] 查看 topic 的分区、副本、ISR 与配置项。 触发场景：kafka describe topic、kafka-topics --describe。对应命令/接口：kafka-topics --describe。"
+    },
+    {
+      "name": "kafka_get_brokers",
+      "description": "[MW-011][感知][L1][免费+] 获取 broker 列表与 API 版本，确认集群成员与协议兼容性。 触发场景：kafka get brokers、kafka-broker-api-versions。对应命令/接口：kafka-broker-api-versions。"
+    },
+    {
+      "name": "kafka_get_consumer_groups",
+      "description": "[MW-012][感知][L1][免费+] 列出全部消费组。 触发场景：kafka get consumer groups、kafka-consumer-groups --list。对应命令/接口：kafka-consumer-groups --list。"
+    },
+    {
+      "name": "kafka_get_lag",
+      "description": "[MW-008][感知][L1][免费+] 查询指定消费组在指定 topic 上的消费堆积（Lag）。 触发场景：kafka get lag、kafka-consumer-groups。对应命令/接口：kafka-consumer-groups。"
+    },
+    {
+      "name": "kafka_list_topics",
+      "description": "[MW-009][感知][L1][免费+] 列出集群全部 topic。 触发场景：kafka list topics、kafka-topics --list。对应命令/接口：kafka-topics --list。"
+    },
+    {
+      "name": "nginx_get_config",
+      "description": "[MW-003][感知][L1][免费+] 读取 Nginx 主配置与 include 配置，用于核对 upstream、server、location 与超时设置。 触发场景：nginx get config、cat nginx.conf。对应命令/接口：cat nginx.conf。"
+    },
+    {
+      "name": "nginx_get_connections",
+      "description": "[MW-002][感知][L1][免费+] 获取 Nginx 连接明细（Active / Reading / Writing / Waiting），定位连接堆积与慢客户端。 触发场景：nginx get connections、curl nginx_status/connections。对应命令/接口：curl nginx_status/connections。"
+    },
+    {
+      "name": "nginx_get_status",
+      "description": "[MW-001][感知][L1][免费+] 获取 Nginx stub_status 总览（活跃连接、accepts、handled、requests），用于健康巡检与容量判断。 触发场景：nginx get status、curl nginx_status。对应命令/接口：curl nginx_status。"
+    },
+    {
+      "name": "redis_get_bigkeys",
+      "description": "[MW-018][感知][L1][免费+] 扫描大 key，定位内存与慢查询隐患。 触发场景：redis get bigkeys、redis-cli --bigkeys。对应命令/接口：redis-cli --bigkeys。"
+    },
+    {
+      "name": "redis_get_client_list",
+      "description": "[MW-021][感知][L1][免费+] 列出当前客户端连接，定位异常来源与空闲连接。 触发场景：redis get client list、redis-cli CLIENT LIST。对应命令/接口：redis-cli CLIENT LIST。"
+    },
+    {
+      "name": "redis_get_info",
+      "description": "[MW-017][感知][L1][免费+] 获取 Redis INFO 全量信息（server/clients/memory/stats/replication）。 触发场景：redis get info、redis-cli INFO。对应命令/接口：redis-cli INFO。"
+    },
+    {
+      "name": "redis_get_memory",
+      "description": "[MW-020][感知][L1][免费+] 获取内存使用明细与碎片率。 触发场景：redis get memory、redis-cli INFO memory。对应命令/接口：redis-cli INFO memory。"
+    },
+    {
+      "name": "redis_get_slowlog",
+      "description": "[MW-019][感知][L1][免费+] 获取慢查询日志，定位高耗时命令。 触发场景：redis get slowlog、redis-cli SLOWLOG GET。对应命令/接口：redis-cli SLOWLOG GET。"
+    },
+    {
+      "name": "tomcat_get_sessions",
+      "description": "[MW-034][感知][L1][免费+] 查看 Tomcat 会话列表与数量。 触发场景：tomcat get sessions、manager/sessions。对应命令/接口：manager/sessions。"
+    },
+    {
+      "name": "tomcat_get_status",
+      "description": "[MW-033][感知][L1][免费+] 获取 Tomcat 运行状态（JVM 内存、线程、请求处理）。 触发场景：tomcat get status、curl manager/status。对应命令/接口：curl manager/status。"
+    },
+    {
+      "name": "zk_get_leader",
+      "description": "[MW-038][感知][L1][免费+] 识别 ZooKeeper 集群 leader 与 follower 分布。 触发场景：zk get leader、echo stat | nc。对应命令/接口：echo stat | nc。"
+    },
+    {
+      "name": "zk_get_status",
+      "description": "[MW-037][感知][L1][免费+] 获取 ZooKeeper 节点状态（模式、连接数、延迟、znode 数）。 触发场景：zk get status、echo stat | nc。对应命令/接口：echo stat | nc。"
+    }
+  ]
+}

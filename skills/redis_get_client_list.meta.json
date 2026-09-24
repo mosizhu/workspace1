@@ -1,0 +1,11 @@
+{
+  "name": "redis_get_client_list",
+  "description": "[MW-021][感知][L1][免费+] 列出当前客户端连接，定位异常来源与空闲连接。 触发场景：redis get client list、redis-cli CLIENT LIST。对应命令/接口：redis-cli CLIENT LIST。",
+  "instructions": "---\nname: redis_get_client_list\ndescription: '[MW-021][感知][L1][免费+] 列出当前客户端连接，定位异常来源与空闲连接。 触发场景：redis get client list、redis-cli CLIENT LIST。对应命令/接口：redis-cli CLIENT LIST。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# redis_get_client_list · 感知\n\n- **Skill ID**: MW-021\n- **名称（LLM 调用）**: `redis_get_client_list`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `redis-cli CLIENT LIST`\n\n## 用途\n\n列出当前客户端连接，定位异常来源与空闲连接。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：redis-cli CLIENT LIST\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 addr、age、idle、cmd 与 name。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+  "labels": [
+    "L1",
+    "redis",
+    "感知",
+    "社区版"
+  ]
+}

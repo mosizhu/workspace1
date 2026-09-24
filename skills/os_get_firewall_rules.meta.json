@@ -1,0 +1,11 @@
+{
+  "name": "os_get_firewall_rules",
+  "description": "[OS-016][感知][L1][免费+] 读取本机防火墙规则链。 触发场景：os get firewall rules、iptables -L。对应命令/接口：iptables -L。",
+  "instructions": "---\nname: os_get_firewall_rules\ndescription: '[OS-016][感知][L1][免费+] 读取本机防火墙规则链。 触发场景：os get firewall rules、iptables -L。对应命令/接口：iptables -L。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_firewall_rules · 感知\n\n- **Skill ID**: OS-016\n- **名称（LLM 调用）**: `os_get_firewall_rules`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `iptables -L`\n\n## 用途\n\n读取本机防火墙规则链。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：iptables -L\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 只读；变更规则属网络团队职责，本团队仅取证。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+  "labels": [
+    "L1",
+    "os",
+    "感知",
+    "社区版"
+  ]
+}

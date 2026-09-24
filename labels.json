@@ -1,0 +1,97 @@
+[
+  {
+    "name": "es",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "kafka",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "L1",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "net",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "nginx",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "normalize",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "os",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "push",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "redis",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "script",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "tomcat",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "zk",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "基础+",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "感知",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "执行-中危",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "执行-低危",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "执行-高危",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "社区",
+    "color": "#6b7280",
+    "resourceType": "skill"
+  },
+  {
+    "name": "社区版",
+    "color": "#245fd6",
+    "resourceType": "skill"
+  }
+]

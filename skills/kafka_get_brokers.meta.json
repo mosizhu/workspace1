@@ -1,0 +1,11 @@
+{
+  "name": "kafka_get_brokers",
+  "description": "[MW-011][感知][L1][免费+] 获取 broker 列表与 API 版本，确认集群成员与协议兼容性。 触发场景：kafka get brokers、kafka-broker-api-versions。对应命令/接口：kafka-broker-api-versions。",
+  "instructions": "---\nname: kafka_get_brokers\ndescription: '[MW-011][感知][L1][免费+] 获取 broker 列表与 API 版本，确认集群成员与协议兼容性。 触发场景：kafka get brokers、kafka-broker-api-versions。对应命令/接口：kafka-broker-api-versions。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_get_brokers · 感知\n\n- **Skill ID**: MW-011\n- **名称（LLM 调用）**: `kafka_get_brokers`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-broker-api-versions`\n\n## 用途\n\n获取 broker 列表与 API 版本，确认集群成员与协议兼容性。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-broker-api-versions\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 结合 controller 信息判断集群是否稳定。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+  "labels": [
+    "kafka",
+    "L1",
+    "感知",
+    "社区版"
+  ]
+}

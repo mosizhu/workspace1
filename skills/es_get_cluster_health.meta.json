@@ -1,0 +1,11 @@
+{
+  "name": "es_get_cluster_health",
+  "description": "[MW-026][感知][L1][免费+] 获取 ES 集群健康状态（green/yellow/red、分片与节点统计）。 触发场景：es get cluster health、GET _cluster/health。对应命令/接口：GET _cluster/health。",
+  "instructions": "---\nname: es_get_cluster_health\ndescription: '[MW-026][感知][L1][免费+] 获取 ES 集群健康状态（green/yellow/red、分片与节点统计）。 触发场景：es get cluster health、GET _cluster/health。对应命令/接口：GET _cluster/health。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# es_get_cluster_health · 感知\n\n- **Skill ID**: MW-026\n- **名称（LLM 调用）**: `es_get_cluster_health`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `GET _cluster/health`\n\n## 用途\n\n获取 ES 集群健康状态（green/yellow/red、分片与节点统计）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：GET _cluster/health\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- yellow 常见于副本未分配；red 表示主分片不可用。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+  "labels": [
+    "es",
+    "L1",
+    "感知",
+    "社区版"
+  ]
+}
