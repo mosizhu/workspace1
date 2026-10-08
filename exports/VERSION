@@ -1,0 +1,12 @@
+# Workspace Export Version
+# Format: vX.Y.Z  YYYY-MM-DD  source=<repo>  commit=<sha>
+
+v2.0.0  2026-10-08  source=mopheus-workspace1  commit=a27d34b
+
+## Changes in v2.0.0
+- Migrated from per-entity JSON files (190+ files) to single JSON arrays per type (4 files)
+- Added Job export (previously "no jobs" in v1)
+- Team count: 21 → 25
+- Agent count: 97 → 97+
+- Skill count: 49 → 49+
+- Cleaned up legacy directory structure (agents/, skills/, teams/)
