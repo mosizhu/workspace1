@@ -1,0 +1,2224 @@
+{
+  "skills": [
+    {
+      "builtin": false,
+      "config": {
+        "source_type": "manual"
+      },
+      "content": "---\nname: db-dm-check\ndescription: 达梦数据库 (DM) 例行巡检 skill，覆盖账号与权限、归档/主备、日志、实例/进程、空间/存储、内存/缓冲池、对象/表结构、性能/会话共 8 大类 33 项检查。触发场景：dm check、dm 巡检、dm health check、dm 健康检查、达梦巡检、达梦健康检查、dm 例行巡检。对应方式：通过 swissql 执行只读 SQL 查询或 OS 命令。\nversion: v1.0.0\ntags: db-check,dm,database,inspection\nparams:\n  - name: conn_name\n    type: string\n    required: true\n    default: \"\"\n    desc: 目标 DM 数据库连接名（从 swissql 连接注册表中选择）\n  - name: detail_level\n    type: string\n    required: false\n    default: \"full\"\n    desc: 巡检深度：full（全量 33 项）/ quick（核心 16 项）/ critical（仅高危 13 项）\nsupport_db: dm\nsafe_level: readonly\nauthor: db-dm-check-team\nupdate_time: 2026-10-08\n---\n\n# 达梦数据库 (DM) 例行巡检 Skill\n\n## 单一职责\n\n通过 swissql 对目标达梦数据库实例执行标准化健康检查，输出结构化巡检报告。覆盖 8 大类 33 项检查，按异常等级（高/中/低）分类输出。\n\n## 为什么必须用本 Skill\n\n直接写巡检逻辑会导致每次回答口径不一致。本 Skill 强制统一的检查项、阈值、输出格式，确保同一份数据同一个样子。\n\n## 执行前准备\n\n### 1. 确认目标连接\n\n通过 swissql 确认目标实例信息：\n\n```bash\n# 通过 swissql 查询连接详情，确认目标达梦数据库实例\n# 使用 db-dm-check 的 conn_name 参数指定目标\n```\n\n多实例时先与用户确认目标。\n\n### 2. 确定巡检深度\n\n- `full`（默认）：全量 33 项\n- `quick`：核心 16 项（覆盖 P0+P1 风险）\n- `critical`：仅高危 13 项（仅 P0 风险）\n\n## 巡检检查项\n\n### 一、账号与权限安全 — 5 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 1 | 被锁定的数据库账号 | DBA_USERS 中 ACCOUNT_STATUS = LOCKED 的账号需记录并确认原因 | 高 | `SELECT USERNAME, ACCOUNT_STATUS, LOCK_DATE, CREATE_DATE FROM DBA_USERS WHERE ACCOUNT_STATUS = 'LOCKED';` |\n| 2 | 数据库密码策略 | DBA_USERS 对应密码策略：PASSWORD_REUSE_MAX、PASSWORD_LIFE_TIME、PASSWORD_LOCK_TIME、PASSWORD_GRACE_TIME 已合理配置 | 高 | `SELECT * FROM DBA_USERS_PROFILE; SELECT * FROM V$PWD_POLICY;` |\n| 3 | 密码即将过期的用户 | PASSWORD_LIFE_TIME 剩余天数 \u003c 7 天的用户需告警 | 高 | `SELECT USERNAME, EXPIRY_TIME, DAYS_LEFT FROM (SELECT USERNAME, EXPIRY_TIME, CASE WHEN EXPIRY_TIME \u003e SYSDATE THEN TRUNC(EXPIRY_TIME - SYSDATE) ELSE TRUNC(SYSDATE - EXPIRY_TIME) END DAYS_LEFT FROM DBA_USERS) WHERE DAYS_LEFT \u003c= 7 AND DAYS_LEFT \u003e= 0;` |\n| 4 | 操作系统账号密码即将过期 | 操作系统用户（如 dmdba）密码过期策略合理 | 中 | 通过 swissql 执行 OS 命令: `chage -l dmdba \\| grep \"Password expires\"` |\n| 5 | 拥有管理员权限的非系统账号 | DBA 权限仅授予系统账号（SYS、SYSTEM），业务账号无 DBA/SYSDBA 权限 | 高 | `SELECT GRANTEE, GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTED_ROLE IN ('DBA', 'SYSDBA', 'SYSOPR') AND GRANTEE NOT IN ('SYS', 'SYSTEM', 'SYS_DBA');` |\n\n### 二、归档 / 主备 — 6 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 6 | 是否归档 | 数据库需处于 ARCHIVELOG 模式 | 高 | `SELECT LOG_MODE FROM V$DATABASE;`（期望值为 ARCHIVELOG） |\n| 7 | 主备状态监控 | 主库 OPEN、备库 MOUNT 或 STANDBY，DM_ARCH_STATUS 正常 | 高 | `SELECT SEQUENCE#, STATUS, ARCHIVE_STATUS FROM V$ARCHIVE_STATUS; SELECT SEQUENCES#, ARCH_DEST, STATUS FROM V$DM_ARCH_INST;` |\n| 8 | 主备 dmwatcher 进程状态 | dmwatcher 进程正常运行且状态为 NORMAL | 高 | 通过 swissql 执行 OS 命令: `ps -ef \\| grep dmwatcher` 及 `tail -50 $DM_HOME/log/dmwatcher.log` |\n| 9 | 主备延迟时间过大 | 主备延迟 \u003c 30 秒（生产环境） | 高 | `SELECT LOCAL_SCN, REMOTE_SCN, TRUNC((LOCAL_SCN - REMOTE_SCN) * 0.001, 2) DELAY_SEC FROM V$ARCHIVE_DEST;` |\n| 10 | 主库未发送给从库的日志量 | 待发送归档日志量 \u003c 100MB 或队列积压 \u003c 5 个文件 | 中 | `SELECT COUNT(*) UNARCHIVED_LOGS, SUM(FILE_SIZE)/1024/1024 MB FROM V$ARCHIVE_DEST WHERE STATUS != 'VALID';` |\n| 11 | 主备归档性能模式设置 | ARCH_MODE = 1（主备模式），归档目标配置正确，至少 2 个归档路径 | 中 | `SELECT ARCH_MODE, CLS_ARCH_MODE, ARCH_DEST, ARCH_FILE_SIZE, ARCH_SPACE_LIMIT FROM V$DM_INI;` |\n\n### 三、日志 — 4 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 12 | 重做日志文件过大 | 单个 REDO 文件大小 \u003c 2GB，总 redo 使用率合理 | 中 | `SELECT GROUP_ID, FILE_SIZE_MB, STATUS FROM V$LOG; SELECT SUM(FILE_SIZE_MB) TOTAL_REDO_MB FROM V$LOG;` |\n| 13 | 归档日志文件过大 | 归档目录总容量 \u003c 文件系统 80%，归档文件未异常堆积 | 高 | 通过 swissql 执行 OS 命令: `du -sh $DM_HOME/arch \\| awk '{print $1}'` 及归档文件数统计 |\n| 14 | 错误日志文件过大 | DMSQL 错误日志文件大小 \u003c 1GB，定期轮转 | 中 | 通过 swissql 执行 OS 命令: `ls -lh $DM_HOME/log/dmerror*.log` |\n| 15 | 数据库实例日志出现严重错误 | dmerror.log / dm.ini 告警日志无 FATAL、ERROR 级别记录 | 高 | 通过 swissql 执行 OS 命令: `grep -i \"FATAL\\|ERROR\\|CRITICAL\" $DM_HOME/log/dmerror.log \\| tail -20` |\n\n### 四、实例 / 进程 — 3 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 16 | 实例运行时间过长 | 实例正常运行时间需合理，长期不重启需评估 | 低 | `SELECT INSTANCE_NAME, STATUS, STARTUP_TIME, TRUNC(MONTHS_BETWEEN(SYSDATE, STARTUP_TIME)*30) RUN_DAYS FROM V$INSTANCE;` |\n| 17 | 实例近期重启次数过多 | 近 7 天内实例重启次数 ≤ 2 次 | 高 | `SELECT INSTANCE_NAME, STATUS, STARTUP_TIME FROM V$INSTANCE ORDER BY STARTUP_TIME DESC; SELECT COUNT(*) RESTART_CNT FROM V$INSTANCE_HIST WHERE STARTUP_TIME \u003e SYSDATE - 7;` |\n| 18 | DMAP 进程状态 | DMAP 守护进程正常运行 | 中 | 通过 swissql 执行 OS 命令: `ps -ef \\| grep dmap` |\n\n### 五、空间 / 存储 — 4 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 19 | 文件系统空间不足 | 各挂载点使用率 \u003c 90% | 高 | 通过 swissql 执行 OS 命令: `df -h \\| awk 'NR\u003e1{print $5}' \\| grep -o '[0-9]*%' \\| sed 's/%//' \\| sort -rn` |\n| 20 | 文件剩余空间 | DM 数据文件所在文件系统剩余空间 \u003e 10GB | 高 | 通过 swissql 执行 OS 命令: `df -h $DM_HOME/data` 关注 Avail 列 |\n| 21 | ASM 空间 | 若使用 ASM 存储，ASM 磁盘组使用率 \u003c 85% | 高 | `SELECT GROUP_NUMBER, NAME, TOTAL_MB, FREE_MB, ROUND(FREE_MB/TOTAL_MB*100,2) FREE_PCT FROM V$ASM_DISKGROUP;` |\n| 22 | TEMP 表空间信息 | TEMP 表空间使用率 \u003c 80%，无空间不足告警 | 中 | `SELECT TABLESPACE_NAME, BYTES_USED/1024/1024 MB_USED, BYTES_FREE/1024/1024 MB_FREE, BYTES_TOTAL/1024/1024 MB_TOTAL FROM V$TEMP_SPACE_HEADER;` |\n\n### 六、内存 / 缓冲池 — 4 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 23 | 数据库内存 | TOTAL_MEM 与实际物理内存匹配，SGA+BUFFER 使用率合理 | 中 | `SELECT ITEM_NAME, ITEM_VALUE FROM V$DM_INI WHERE ITEM_NAME IN ('TOTAL_MEM', 'BUFFER', 'KEEP_BUF', 'HASH_SIZE', 'MAX_BUFFER');` |\n| 24 | 字典缓冲区 | DICT_BUF_HIT 命中率 \u003e 95% | 中 | `SELECT DICT_BUF_HIT FROM V$SYSTEM_PERF;` 或 `SELECT GETS, GETMISSES, (1 - GETMISSES/GETS)*100 HIT_RATIO FROM V$DICTIONARY_CACHE;` |\n| 25 | SQL 缓冲池 | SQL 缓存命中率 \u003e 90% | 中 | `SELECT POOL_NAME, POOL_SIZE, USED_SIZE, FREE_SIZE FROM V$MEMORY_POOL;` |\n| 26 | 线程数 | ACTIVE_SESSIONS 未超过最大会话数 80%，线程数与 CPU 核心匹配 | 中 | `SELECT COUNT(*) ACTIVE_SESSIONS FROM V$SESSION WHERE STATUS = 'ACTIVE'; SELECT VALUE MAX_SESSIONS FROM V$DM_INI WHERE ITEM_NAME = 'MAX_SESSIONS';` |\n\n### 七、对象 / 表结构 — 4 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 27 | 大表无索引 | 行数 \u003e 100 万行的表至少有一个索引 | 高 | `SELECT OWNER, TABLE_NAME, TABLE_BYTES/1024/1024 MB, ROW_COUNT FROM (SELECT A.OWNER, A.TABLE_NAME, A.TABLESPACE_NAME, SUM(B.BYTES)/1024/1024 MB, MAX(C.ROW_COUNT) ROW_COUNT FROM DBA_TABLES A, DBA_SEGMENTS B, (SELECT OWNER, TABLE_NAME, AVG(ROWS_PER_BLOCK*BLOCKS) ROW_COUNT FROM DBA_TABLES GROUP BY OWNER, TABLE_NAME) C WHERE A.TABLE_NAME = B.SEGMENT_NAME AND A.TABLE_NAME = C.TABLE_NAME GROUP BY A.OWNER, A.TABLE_NAME, A.TABLESPACE_NAME, C.ROW_COUNT) WHERE ROW_COUNT \u003e 1000000 AND TABLE_NAME NOT IN (SELECT DISTINCT TABLE_NAME FROM DBA_IND_COLUMNS);` |\n| 28 | 大表索引数量过多 | 单表索引数 \u003e 15 个需评审 | 中 | `SELECT OWNER, TABLE_NAME, COUNT(*) IDX_CNT FROM DBA_IND_COLUMNS GROUP BY OWNER, TABLE_NAME HAVING COUNT(*) \u003e 15;` |\n| 29 | 大表未分区 | 行数 \u003e 1000 万行的表建议分区 | 低 | `SELECT OWNER, TABLE_NAME, ROW_COUNT FROM (SELECT OWNER, TABLE_NAME, ROWS ROW_COUNT FROM DBA_TABLES) WHERE ROW_COUNT \u003e 10000000 AND TABLE_NAME NOT IN (SELECT P_TABLE_NAME FROM DBA_TAB_PARTITIONS);` |\n| 30 | 碎片率过高的索引 | INDEX 碎片率（LEAF_BLOCKS/DISTINCT_KEYS）\u003c 0.8 | 中 | `SELECT INDEX_NAME, OWNER, LEAF_BLOCKS, DISTINCT_KEYS, FRAG_RATIO FROM (SELECT I.INDEX_NAME, I.OWNER, I.LEAF_BLOCKS, I.DISTINCT_KEYS, CASE WHEN I.DISTINCT_KEYS \u003e 0 THEN ROUND(1 - I.LEAF_BLOCKS/I.DISTINCT_KEYS, 4) ELSE 0 END FRAG_RATIO FROM DBA_INDEXES I WHERE LEAF_BLOCKS \u003e 0) WHERE FRAG_RATIO \u003c 0.2 OR FRAG_RATIO IS NULL;` |\n\n### 八、性能 / 会话 — 3 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 31 | 等待事件信息 | 热点等待事件需关注，无长时间阻塞 | 高 | `SELECT EVENT, TOTAL_WAITS, TIME_WAITED FROM V$SYSTEM_EVENT WHERE EVENT NOT IN ('SQL*Net message from client', 'SQL*Net message to client', 'pmon timer') ORDER BY TIME_WAITED DESC FETCH FIRST 20 ROWS ONLY;` |\n| 32 | 会话隔离级别 | 会话的 ISOLATION 级别符合业务要求，无异常 READ COMMITTED / REPEATABLE READ 混用 | 低 | `SELECT SESS_ID, USERNAME, STATUS, ISOLATION, WAIT_EVENT FROM V$SESSION;` |\n| 33 | 会话隔离级别检查 | 确认会话隔离级别与数据库默认隔离级别一致，异常会话需记录 | 低 | `SELECT * FROM (SELECT SESS_ID, USERNAME, STATUS, ISOLATION, SQL_TEXT FROM V$SESSION) WHERE ISOLATION NOT IN (SELECT VALUE FROM V$DM_INI WHERE ITEM_NAME = 'ISOLATION');` |\n\n## 巡检执行流程\n\n### Step 1: 系统信息收集\n\n通过 swissql 连接目标 DM 实例，依次执行上述 SQL。每条 SQL 执行后记录：\n- 是否正常返回\n- 返回的实际值\n- 是否超阈值\n\n### Step 2: 异常判定与分级\n\n将每条检查结果与对应阈值比对，标记为：\n\n| 等级 | 说明 | 行动建议 |\n|------|------|----------|\n| 高 | 可能导致数据丢失、服务中断、安全泄露 | 必须立即处理 |\n| 中 | 影响性能或长期稳定性 | 建议在维护窗口处理 |\n| 低 | 配置不最优但不紧急 | 可纳入优化计划 |\n\n### Step 3: 生成巡检报告\n\n## 输出格式（固定结构）\n\n### 巡检结论\n\n| 指标 | 值 |\n|------|----|\n| 目标实例 | host:port / 连接名 |\n| DM 版本 | Vx.x.x.x |\n| 实例状态 | OPEN / MOUNTED / ... |\n| 归档模式 | ARCHIVELOG / NOARCHIVELOG |\n| 巡检时间 | YYYY-MM-DD HH:MM |\n| 总检查项 | 33 |\n| 异常项数 | N（高/中/低） |\n| 整体健康度 | 良好 / 一般 / 较差 / 危险 |\n\n### 异常项明细\n\n**【高】**\n\n| 序号 | 检查项 | 当前值 | 阈值/期望 | 风险描述 |\n|------|--------|--------|----------|----------|\n| ... | ... | ... | ... | ... |\n\n**【中】**\n\n（同上格式）\n\n**【低】**\n\n（同上格式）\n\n### 关键指标快照\n\n| 指标 | 值 |\n|------|----|\n| 实例名称 | DMxxxx |\n| 实例运行天数 | N |\n| 归档模式 | ARCHIVELOG / NOARCHIVELOG |\n| 主备状态 | 主/备/未知 |\n| 主备延迟 (秒) | N |\n| 活跃会话数 | N |\n| 总表空间数 | N |\n| 大表数 (\u003e100万行) | N |\n| 无索引大表数 | N |\n| 碎片率过高索引数 | N |\n\n### 建议\n\n逐条列出对应异常项的修复建议。\n\n## 安全边界\n\n- **只读**：仅执行 SELECT 类只读操作\n- **不修改**：不执行任何 ALTER、GRANT、REVOKE、DROP、CREATE、TRUNCATE、DELETE、UPDATE\n- **不清理**：不清理告警日志、不删除归档日志、不重建索引\n- **不猜测**：查询失败就如实报告，禁止编造数据\n- **不跳过**：33 项检查逐项执行，不跳项、不省略\n\n## 异常处理\n\n| 异常场景 | 处理方式 |\n|----------|----------|\n| swissql 连接失败 | 报告\"无法连接目标实例\"，不自行排查网络 |\n| 部分 SQL 返回错误 | 记录为\"查询失败\"，继续执行剩余检查项 |\n| 权限不足 | 报告需要哪些权限，不尝试绕过 |\n| 目标非 DM 实例 | 报告\"目标实例非 DM\"，不强行执行 DM 巡检 |\n| 主备环境节点不响应 | 标注受影响节点，继续检查其他节点 |\n\n## 达梦数据库关键视图参考\n\n| 用途 | 视图名 |\n|------|--------|\n| 实例信息 | V$INSTANCE |\n| 数据库信息 | V$DATABASE |\n| 会话信息 | V$SESSION |\n| 等待事件 | V$SYSTEM_EVENT |\n| 内存配置 | V$DM_INI |\n| 日志状态 | V$LOG, V$ARCHIVE_LOG, V$ARCHIVE_DEST |\n| 归档实例 | V$DM_ARCH_INST |\n| 表空间 | V$TABLESPACE |\n| 段信息 | DBA_SEGMENTS |\n| 表信息 | DBA_TABLES |\n| 索引信息 | DBA_INDEXES, DBA_IND_COLUMNS |\n| 用户信息 | DBA_USERS |\n| 权限信息 | DBA_ROLE_PRIVS, DBA_SYS_PRIVS |\n| 缓冲区命中 | V$SYSTEM_PERF, V$DICTIONARY_CACHE |\n| 临时表空间 | V$TEMP_SPACE_HEADER |\n| 内存池 | V$MEMORY_POOL |\n| 告警日志 | 通过 swissql OS 命令读取 $DM_HOME/log/dmerror.log |",
+      "createdAt": "2026-10-08T11:32:00.257233+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "达梦数据库 (DM) 例行巡检 skill，覆盖账号与权限、归档/主备、日志、实例/进程、空间/存储、内存/缓冲池、对象/表结构、性能/会话共 8 大类 33 项检查。触发场景：dm check、dm 巡检、dm health check、dm 健康检查、达梦巡检、达梦健康检查、dm 例行巡检。对应方式：通过 swissql 执行只读 SQL 查询或 OS 命令。",
+      "id": "77e5ed75-e94e-4dd5-babf-11b91ef32de9",
+      "labels": [
+        {
+          "color": "#d22d82",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "9fdd3591-86fc-484f-bb7b-e1c2de79e140",
+          "name": "dm",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "db-dm-check",
+      "updatedAt": "2026-10-08T11:32:00.257233+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": {
+        "source_type": "manual"
+      },
+      "content": "---\nname: db-oracle-check\ndescription: Oracle 数据库例行巡检 skill，覆盖高可用与集群、实例/进程/文件状态、日志与告警、备份/存储/空间与完整性、内存/性能、安全/权限/账户、对象/结构治理、参数/网络合规共 8 大类 32 项检查。触发场景：oracle check、oracle 巡检、oracle health check、oracle 健康检查、oracle 例行巡检。对应方式：通过 swissql 执行只读 SQL 查询。\nversion: v1.0.0\ntags: db-check,oracle,inspection\nparams:\n  - name: conn_name\n    type: string\n    required: true\n    default: \"\"\n    desc: 目标 Oracle 连接名（从 swissql 连接注册表中选择）\n  - name: detail_level\n    type: string\n    required: false\n    default: \"full\"\n    desc: 巡检深度：full（全量 32 项）/ quick（核心 16 项）/ critical（仅高危 10 项）\nsupport_db: oracle\nsafe_level: readonly\nauthor: db-oracle-query-team\nupdate_time: 2026-10-08\n---\n\n# Oracle 数据库例行巡检 Skill\n\n## 单一职责\n\n通过 swissql 对目标 Oracle 实例执行标准化健康检查，输出结构化巡检报告。覆盖 8 大类 32 项检查，按异常等级（高/中/低）分类输出。\n\n## 为什么必须用本 Skill\n\n直接写巡检逻辑会导致每次回答口径不一致。本 Skill 强制统一的检查项、阈值、输出格式，确保同一份数据同一个样子。\n\n## 执行前准备\n\n### 1. 确认目标连接\n\n通过 swissql 确认目标实例信息：\n\n```bash\n# 通过 swissql 查询连接详情，确认目标 Oracle 实例\n# 使用 db-oracle-check 的 conn_name 参数指定目标\n```\n\n多实例时先与用户确认目标。\n\n### 2. 确定巡检深度\n\n- `full`（默认）：全量 32 项\n- `quick`：核心 16 项（覆盖 P0+P1 风险）\n- `critical`：仅高危 10 项（仅 P0 风险）\n\n## 巡检检查项\n\n### 一、高可用与集群（RAC / Data Guard）— 5 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 1 | 备库应用状态异常检查 | standby 库需处于 ARCHIVED LOG 应用状态 | 高 | `SELECT DEST_ID, STATUS, TARGET, DATABASE_TYPE, PROTECTION_MODE, PROTECTION_LEVEL, RECOVERY_MODE FROM V$ARCHIVE_DEST_STATUS WHERE TARGET='STANDBY';` |\n| 2 | DG 异常信息检查 | V$DATAGUARD_STATUS 无 ERROR/WARNING 级别记录 | 高 | `SELECT MESSAGE_LEVEL, MESSAGE FROM V$DATAGUARD_STATUS WHERE MESSAGE_LEVEL \u003e= 4 ORDER BY TIMESTAMP DESC FETCH FIRST 20 ROWS ONLY;` |\n| 3 | RAC 数据库未关闭 DRM 检查 | RAC 环境下需确认 DRM(Disk-Redundancy) 已正确配置 | 中 | `SELECT GROUP_NUMBER, NAME, TYPE, TOTAL_MB, FREE_MB, REQUIRED_MIRROR_FREE_MB, USABLE_FILE_MB FROM V$ASM_DISKGROUP;` |\n| 4 | RAC 跨节点并行设置违规检查 | PARALLEL_SERVER_INSTANCES 及并行实例参数跨节点一致 | 中 | `SELECT INST_ID, NAME, VALUE, ISSES_MODIFIABLE, ISSYS_MODIFIABLE FROM GV$PARAMETER WHERE NAME LIKE '%parallel%' ORDER BY 1, 2;` |\n| 5 | ORACLE 单实例无法承载业务压力 | CPU/内存/IO 资源利用率 \u003e 85% 持续 30min 以上 | 高 | `SELECT METRIC_NAME, CURRENTVAL FROM V$SYSMETRIC WHERE METRIC_NAME IN ('Host CPU Utilization (ms)', 'Database CPU Time Ratio', 'Response Time (ms)') AND CURRENTVAL \u003e 85;` |\n\n### 二、实例/进程/文件状态 — 6 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 6 | 实例近期重启检查 | 近 7 天内实例重启次数 ≤ 1 次 | 高 | `SELECT INSTANCE_NAME, STATUS, DATABASE_STATUS, STARTUP_TIME FROM GV$INSTANCE; SELECT VALUE FROM V$SYSSTAT WHERE NAME='instance restart count';` |\n| 7 | PDB 状态发现异常检查 | 所有 PDB 状态为 OPEN 或 MOUNTED | 高 | `SELECT NAME, OPEN_MODE, TOTAL_SIZE, CONSTRAINT FROM V$PDBS;` |\n| 8 | 数据库实例状态异常检查 | 所有实例 STATUS=STARTED 且 DATABASE_STATUS=ACTIVE | 高 | `SELECT INST_ID, INSTANCE_NAME, STATUS FROM GV$INSTANCE ORDER BY INST_ID;` |\n| 9 | 主机近期发生重启检查 | 近 7 天内 OS 重启次数 ≤ 1 次 | 中 | 通过 swissql 执行 OS 命令: `uptime` 或 `last reboot` |\n| 10 | 数据文件状态异常检查 | 所有数据文件 STATUS=AVAILABLE | 高 | `SELECT FILE_NAME, TABLESPACE_NAME, STATUS, BYTES/1024/1024 MB FROM DBA_DATA_FILES WHERE STATUS != 'AVAILABLE';` |\n| 11 | SQLPLUS 进程数超标检查 | 活跃会话数 \u003c 最大会话数的 80% | 中 | `SELECT COUNT(*) ACTIVE_SESSIONS FROM V$SESSION WHERE STATUS='ACTIVE'; SELECT VALUE MAX_SESSIONS FROM V$PARAMETER WHERE NAME='sessions';` |\n\n### 三、日志与告警 — 4 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 12 | 近期 ALERT 日志异常检查 | 近 24h 内 ALERT LOG 无 ORA- 级别错误 | 高 | `SELECT LOG_LEVEL, MESSAGE FROM V$DIAG_ALERT_EXT WHERE LOG_LEVEL IN ('Exception', 'Fatal') AND TIMESTAMP \u003e SYSDATE - 1 ORDER BY TIMESTAMP DESC;` |\n| 13 | 系统日志严重错误检查 | OS 层面 /var/log/messages 或 /var/log/syslog 无严重错误 | 高 | 通过 swissql 执行 OS 命令: `grep -i \"error\\|critical\\|emergency\" /var/log/messages \\| tail -20` |\n| 14 | 近期 INCIDENT 异常检查 | V$DIAG_INCIDENT 近 24h 无新 INCIDENT | 中 | `SELECT INCIDENT_ID, PROBLEM_KEY, CREATION_DATE, STATUS FROM V$DIAG_INCIDENT WHERE CREATION_DATE \u003e SYSDATE - 1 ORDER BY CREATION_DATE DESC;` |\n| 15 | 超大监听日志检查 | 监听日志文件 \u003c 2GB，且已轮转 | 中 | 通过 swissql 执行 OS 命令: `ls -lh /opt/oracle/diag/rdbms/*/trace/alert_*.log \\` 或检查监听日志文件大小 |\n\n### 四、备份/存储/空间与完整性 — 8 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 16 | 表空间使用率超标检查 | 表空间使用率 \u003c 90%（自动扩展需确认） | 高 | `SELECT TABLESPACE_NAME, ROUND(USED_PCT,2) USED_PCT FROM (SELECT A.TABLESPACE_NAME, ROUND((A.BYTES_total - B.BYTES_free)/A.BYTES_total*100, 2) USED_PCT FROM (SELECT TABLESPACE_NAME, SUM(BYTES) BYTES_total FROM DBA_DATA_FILES GROUP BY TABLESPACE_NAME) A, (SELECT TABLESPACE_NAME, SUM(BYTES) BYTES_free FROM DBA_FREE_SPACE GROUP BY TABLESPACE_NAME) B WHERE A.TABLESPACE_NAME = B.TABLESPACE_NAME) ORDER BY USED_PCT DESC;` |\n| 17 | 主机文件系统使用率超标检查 | 各文件系统使用率 \u003c 90% | 高 | 通过 swissql 执行 OS 命令: `df -h \\| awk 'NR\u003e1{print $5}' \\| grep -o '[0-9]*%' \\| sed 's/%//' \\| sort -rn` |\n| 18 | FRA 使用率超标检查 | FRA 使用率 \u003c 90%（RECOVERY_AREA_USAGE） | 高 | `SELECT TYPE, PERCENT_SPACE_USED, PERCENT_SPACE_RECLAIMABLE, PERCENT_FILES_FROM_QUOTA FROM V$RECOVERY_AREA_USAGE;` |\n| 19 | 回收站垃圾数据过多检查 | RECYCLEBIN 占用空间 \u003c FRA 的 20% | 中 | `SELECT OBJECT_NAME, ORIGINAL_NAME, TYPE, DROP_TIME, SPACE/1024/1024 MB FROM USER_RECYCLEBIN ORDER BY SPACE DESC;` |\n| 20 | 文件系统文件数过多检查 | inode 使用率 \u003c 90% | 中 | 通过 swissql 执行 OS 命令: `df -i \\| awk 'NR\u003e1{print $5}' \\| grep -o '[0-9]*%' \\| sed 's/%//' \\| sort -rn` |\n| 21 | 最大文件数检查 | 数据文件数 \u003c 上限(通常 1024~65536) | 中 | `SELECT COUNT(*) FILE_COUNT FROM DBA_DATA_FILES; SELECT COUNT(*) FILE_COUNT FROM DBA_TEMP_FILES;` |\n| 22 | 数据库坏块检查 | V$DATABASE_BLOCK_CORRUPTION 无记录 | 高 | `SELECT * FROM V$DATABASE_BLOCK_CORRUPTION;` |\n| 23 | 数据库坏块数量检查 | 坏块数 = 0（如有需确认是否已 RMAN BLOCKRECOVER） | 高 | `SELECT COUNT(*) CORRUPT_BLOCKS FROM V$DATABASE_BLOCK_CORRUPTION;` |\n\n### 五、内存/性能 — 5 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 24 | 主机内存使用率超标检查 | Oracle 占用的 SGA+PGA \u003c 主机总内存 80% | 中 | 通过 swissql 执行 OS 命令: `free -m \\| awk '/Mem:/{printf \"%.1f%%\", $3/$2*100}'` + DB 侧 SGA/PGA 汇总 |\n| 25 | SGA 和 PGA 设置过小检查 | SGA_TARGET 和 PGA_AGGREGATE_TARGET 合理（根据负载评估） | 中 | `SELECT NAME, VALUE/1024/1024 MB FROM V$PGASTAT WHERE NAME LIKE '%target'; SELECT * FROM V$SGAINFO;` |\n| 26 | 未设置大页检查 | HugePages 已配置且大小匹配 SGA | 中 | 通过 swissql 执行 OS 命令: `cat /proc/meminfo \\| grep -i huge` + DB 侧参数 `huge_pages` |\n| 27 | SHAREDPOOL 占用空间过小检查 | SHAREDPOOL 命中率 \u003e 95%（pin hit ratio） | 中 | `SELECT POOL, SUM(BYTES)/1024/1024 MB FROM V$SGASTAT WHERE POOL='shared pool' GROUP BY POOL; SELECT NAMESPACE, GETMISSES, (1 - GETMISSES/GETS)*100 HIT_RATIO FROM V$LIBRARYCACHE WHERE GETS \u003e 0;` |\n| 28 | 系统 PAGE 使用率超标检查 | 系统 swap/page 使用率 \u003c 20% | 中 | 通过 swissql 执行 OS 命令: `vmstat 1 5 \\| tail -1` 观察 si/so 列 |\n\n### 六、安全/权限/账户 — 4 项\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL 口径 |\n|---|--------|-----------|----------|----------|\n| 29 | 数据库勒索病毒检查 | 无异常进程绑定 Oracle 端口、无异常文件权限变更 | 高 | 通过 swissql 执行 OS 命令: `ps aux \\| grep -i oracle \\| grep -v grep` + `find / -name \"*.key\" -o -name \"*.pem\" -newer /etc/passwd 2\u003e/dev/null \\| head -20` |\n| 30 | 数据库用户密码即将过期检查 | 密码过期剩余 \u003e 7 天 | 高 | `SELECT USERNAME, PASSWORD_LIFE_DAYS, EXPIRY_DATE, DAYS_LEFT FROM (SELECT u.username USERNAME, p.expiry_date, p.profile, p.password_lifetime PASSWORD_LIFE_DAYS, CASE WHEN p.expiry_date \u003e SYSDATE THEN ROUND((p.expiry_date - SYSDATE)) ELSE ROUND((SYSDATE - p.expiry_date)) END DAYS_LEFT FROM dba_users u, dba_profiles p WHERE u.profile = p.profile AND p.profile NOT IN ('DEFAULT') AND p.resource_name = 'PASSWORD_LIFE_TIME');` |\n| 31 | 业务账号 DBA 权限检查 | 业务账号无 DBA/SYSDBA 权限 | 高 | `SELECT GRANTEE, GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTED_ROLE IN ('DBA', 'SYSDBA', 'SYSOPER') AND GRANTEE NOT IN ('SYS', 'SYSTEM', 'SYSMAN') MINUS SELECT USERNAME, NULL FROM DBA_USERS WHERE USERNAME IN ('SYS', 'SYSTEM');` |\n| 32 | 主机帐号密码过期检查 | OS 用户(如 oracle) 密码未过期 | 中 | 通过 swissql 执行 OS 命令: `chage -l oracle \\| grep \"Password expires\"` |\n\n## 巡检执行流程\n\n### Step 1: 系统信息收集\n\n通过 swissql 连接目标 Oracle 实例，依次执行上述 SQL。每条 SQL 执行后记录：\n- 是否正常返回\n- 返回的实际值\n- 是否超阈值\n\n### Step 2: 异常判定与分级\n\n将每条检查结果与对应阈值比对，标记为：\n\n| 等级 | 说明 | 行动建议 |\n|------|------|----------|\n| 高 | 可能导致数据丢失、服务中断、安全泄露 | 必须立即处理 |\n| 中 | 影响性能或长期稳定性 | 建议在维护窗口处理 |\n| 低 | 配置不最优但不紧急 | 可纳入优化计划 |\n\n### Step 3: 生成巡检报告\n\n## 输出格式（固定结构）\n\n### 巡检结论\n\n| 指标 | 值 |\n|------|----|\n| 目标实例 | host:port / SID / 连接名 |\n| Oracle 版本 | x.x.x.x |\n| 实例状态 | OPEN / MOUNTED / ... |\n| RAC 节点数 | N |\n| 巡检时间 | YYYY-MM-DD HH:MM |\n| 总检查项 | 32 |\n| 异常项数 | N（高/中/低） |\n| 整体健康度 | 良好 / 一般 / 较差 / 危险 |\n\n### 异常项明细\n\n**【高】**\n\n| 序号 | 检查项 | 当前值 | 阈值/期望 | 风险描述 |\n|------|--------|--------|----------|----------|\n| ... | ... | ... | ... | ... |\n\n**【中】**\n\n（同上格式）\n\n**【低】**\n\n（同上格式）\n\n### 关键指标快照\n\n| 指标 | 值 |\n|------|----|\n| SGA 大小 (MB) | N |\n| PGA 大小 (MB) | N |\n| 共享池命中率 (%) | N |\n| 表空间数量 | N |\n| 表空间使用率 Top3 | TS1: N% / TS2: N% / TS3: N% |\n| FRA 使用率 (%) | N |\n| 活跃会话数 | N |\n| 数据文件大小数 | N |\n| 坏块数 | N |\n\n### 建议\n\n逐条列出对应异常项的修复建议。\n\n## 安全边界\n\n- **只读**：仅执行 SELECT 类只读操作\n- **不修改**：不执行任何 ALTER、GRANT、REVOKE、DROP、CREATE、TRUNCATE、DELETE、UPDATE\n- **不清理**：不清理告警日志、不清空回收站、不删除归档日志\n- **不猜测**：查询失败就如实报告，禁止编造数据\n- **不跳过**：32 项检查逐项执行，不跳项、不省略\n\n## 异常处理\n\n| 异常场景 | 处理方式 |\n|----------|----------|\n| swissql 连接失败 | 报告\"无法连接目标实例\"，不自行排查网络 |\n| 部分 SQL 返回错误 | 记录为\"查询失败\"，继续执行剩余检查项 |\n| 权限不足 | 报告需要哪些权限，不尝试绕过 |\n| 目标非 Oracle 实例 | 报告\"目标实例非 Oracle\"，不强行执行 Oracle 巡检 |\n| RAC 环境节点不响应 | 标注受影响节点，继续检查其他节点 |",
+      "createdAt": "2026-10-08T11:11:19.319999+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "Oracle 数据库例行巡检 skill，覆盖高可用与集群、实例/进程/文件状态、日志与告警、备份/存储/空间与完整性、内存/性能、安全/权限/账户、对象/结构治理、参数/网络合规共 8 大类 32 项检查。触发场景：oracle check、oracle 巡检、oracle health check、oracle 健康检查、oracle 例行巡检。对应方式：通过 swissql 执行只读 SQL 查询。",
+      "id": "0792ea19-41b8-4783-94ef-b187dfab1087",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#d22d53",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "6b4b97fb-637a-4788-ba07-d6a7c3ffd22b",
+          "name": "oracle",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "db-oracle-check",
+      "updatedAt": "2026-10-08T11:11:19.319999+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": {
+        "source_type": "manual"
+      },
+      "content": "---\nname: db-mysql-check\ndescription: MySQL 数据库例行巡检 skill，覆盖主机/系统层、InnoDB/存储引擎、日志/Binlog、连接/会话/缓存、复制/主从、安全/账户、对象/表结构、运行状态等 8 大类共 42 项检查。触发场景：mysql check、mysql 巡检、mysql health check、mysql 健康检查、mysql 例行巡检。对应方式：通过 swissql 执行只读 SQL/SHOW 命令。\nversion: v1.0.0\ntags: db-check,mysql,inspection\nparams:\n  - name: conn_name\n    type: string\n    required: true\n    default: \"\"\n    desc: 目标 MySQL 连接名（从 swissql 连接注册表中选择）\n  - name: detail_level\n    type: string\n    required: false\n    default: \"full\"\n    desc: 巡检深度：full（全量 42 项）/ quick（核心 20 项）/ critical（仅高危 10 项）\nsupport_db: mysql\nsafe_level: readonly\nauthor: db-mysql-query-team\nupdate_time: 2026-10-08\n---\n\n# MySQL 数据库例行巡检 Skill\n\n## 单一职责\n\n通过 swissql 对目标 MySQL 实例执行标准化健康检查，输出结构化巡检报告。覆盖 8 大类 42 项检查，按异常等级（高/中/低）分类输出。\n\n## 为什么必须用本 Skill\n\n直接写巡检逻辑会导致每次回答口径不一致。本 Skill 强制统一的检查项、阈值、输出格式，确保同一份数据同一个样子。\n\n## 执行前准备\n\n### 1. 确认目标连接\n\n通过 swissql 确认目标实例信息：\n\n```bash\n# 通过 swissql 查询连接详情，确认目标 MySQL 实例\n# 使用 db-mysql-check 的 conn_name 参数指定目标\n```\n\n多实例时先与用户确认目标。\n\n### 2. 确定巡检深度\n\n- `full`（默认）：全量 42 项\n- `quick`：核心 20 项（覆盖 P0+P1 风险）\n- `critical`：仅高危 10 项（仅 P0 风险）\n\n## 巡检检查项\n\n### 一、主机/系统层（6 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 1 | 系统最小保留内存 | `vm.min_free_kbytes` ≥ 65536 (64MB) | 中 | `SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_data';` + OS `free -m` |\n| 2 | 系统内存设置 | `vm.overcommit_memory` = 0 或 2 | 低 | `cat /proc/sys/vm/overcommit_memory` |\n| 3 | 虚拟内存回收频率 | `vm.vfs_cache_pressure` ≤ 100 | 低 | `SHOW GLOBAL STATUS LIKE 'Created_tmp%';` 间接判断 |\n| 4 | 系统 NUMA | NUMA 关闭 或 MySQL 启用 `numactl` | 中 | `numactl --hardware` 或 `dmesg | grep -i numa` |\n| 5 | 文件打开数 | `ulimit -n` ≥ 65535；`SHOW GLOBAL STATUS LIKE 'Open_files'` \u003c 20000 | 高 | `Open_files / Opened_files` |\n| 6 | 连接错误数 | `Aborted_connects` \u003c 1000 | 高 | `SHOW GLOBAL STATUS LIKE 'Aborted_connects';` |\n\n### 二、InnoDB / 存储引擎参数（10 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 7 | innodb_buffer_pool_size | 无硬性上限，但 ≤ 物理内存 70% | 中 | `SHOW VARIABLES LIKE 'innodb_buffer_pool_size';` |\n| 8 | Innodb_buffer_pool_instances | 不在 4-32 范围内时告警 | 低 | `SHOW VARIABLES LIKE 'innodb_buffer_pool_instances';` |\n| 9 | Redo 日志文件大小 | ≥ 1G | 中 | `SHOW VARIABLES LIKE 'innodb_log_file_size';` |\n| 10 | Redo Log Buffer | 不在 8M-64M 范围内时告警 | 低 | `SHOW VARIABLES LIKE 'innodb_log_buffer_size';` |\n| 11 | Innodb 线程配置 | `innodb_thread_concurrency` 在 4-16 内 | 低 | `SHOW VARIABLES LIKE 'innodb_thread_concurrency';` |\n| 12 | innodb_doublewrite | 必须开启（ON） | 高 | `SHOW VARIABLES LIKE 'innodb_doublewrite';` |\n| 13 | innodb_flush_method | 必须为 O_DIRECT | 高 | `SHOW VARIABLES LIKE 'innodb_flush_method';` |\n| 14 | 双 1 设置 | `sync_binlog=1` AND `innodb_flush_log_at_trx_commit=1` | 高 | 两变量均查 |\n| 15 | 使用 MyISAM 存储引擎 | 不允许 | 高 | `SELECT engine FROM information_schema.tables WHERE engine='MyISAM' AND table_schema NOT IN ('information_schema','mysql','performance_schema','sys');` |\n| 16 | 独立表空间 | `innodb_file_per_table=ON` | 中 | `SHOW VARIABLES LIKE 'innodb_file_per_table';` |\n\n### 三、日志 / Binlog（6 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 17 | binlog 开启 | `log_bin=ON` | 高 | `SHOW VARIABLES LIKE 'log_bin';` |\n| 18 | binlog 缓存大小 | 不在 1M-16M 范围内时告警 | 低 | `SHOW VARIABLES LIKE 'binlog_cache_size';` 与 `Show Status LIKE 'Binlog_cache_%';` |\n| 19 | 自动清理 Binlog | `expire_logs_days` 或 `binlog_expire_logs_seconds` 有设置 | 中 | `SHOW VARIABLES LIKE 'expire_logs_days';` / `binlog_expire_logs_seconds` |\n| 20 | GTID 开启 | `gtid_mode=ON` 且 `enforce_gtid_consistency=ON` | 中 | 两变量均查 |\n| 21 | 错误日志 | 检查错误日志路径与近期错误 | 高 | `SHOW VARIABLES LIKE 'log_error';` + `tail` 错误日志 |\n| 22 | 慢日志监控 | `slow_query_log=ON`；`long_query_time` ≤ 1 | 中 | `SHOW VARIABLES LIKE 'slow_query_log%';` / `long_query_time` |\n\n### 四、连接 / 会话 / 缓存（4 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 23 | 最大连接数 | `max_connections` 不宜 \u003e 5000 | 中 | `SHOW VARIABLES LIKE 'max_connections';` |\n| 24 | 会话缓存 | `sort_buffer_size` 等不在 256K-8M 范围时告警 | 低 | `SHOW VARIABLES LIKE 'sort_buffer_size';` / `read_buffer_size` / `read_rnd_buffer_size` |\n| 25 | 临时表大小 | `tmp_table_size` 和 `max_heap_table_size` 在 4M-128M 内 | 中 | `SHOW VARIABLES LIKE 'tmp_table_size';` / `max_heap_table_size` |\n| 26 | 表缓存/定义缓存 | `table_open_cache` + `table_definition_cache` \u003c 1000 时告警 | 低 | `SHOW VARIABLES LIKE 'table_open_cache';` / `table_definition_cache` |\n\n### 五、复制 / 主从（3 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 27 | slave_net_timeout | ≤ 4s（推荐 60s 以内，≤4 为佳） | 中 | `SHOW GLOBAL VARIABLES LIKE 'slave_net_timeout';` 注：应为 slave/net_timeout |\n| 28 | 从库 read_only | 从库 `read_only=ON` | 高 | `SHOW GLOBAL VARIABLES LIKE 'read_only';` |\n| 29 | 复制线程数 | `slave_parallel_workers` ≥ 4 | 中 | `SHOW GLOBAL VARIABLES LIKE 'slave_parallel_workers';` |\n\n### 六、安全 / 账户（2 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 30 | 密码过期 | 所有用户 password_expired ≠ 'Y' 且 password_lifetime ≤ 90 | 高 | `SELECT User, Host, Password_expired, Password_lifetime, password_last_changed FROM mysql.user;` |\n| 31 | 匿名账户 | 无空用户名的账户 | 高 | `SELECT User, Host FROM mysql.user WHERE User='';` |\n\n### 七、对象 / 表结构（11 项）\n\n| # | 检查项 | 阈值/规则 | 风险等级 | SQL/命令口径 |\n|---|--------|-----------|----------|-------------|\n| 32 | 自增 ID 使用率 | `Auto_inc_rows / Max_value` \u003e 80% 时告警 | 高 | `SELECT table_name, auto_increment FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','mysql','performance_schema','sys');` |\n| 33 | 碎片率 \u003e 30% 表 | `Data_free / (Data_length + Index_length) \u003e 30%` | 中 | `SELECT table_name, DATA_FREE, DATA_LENGTH, INDEX_LENGTH FROM information_schema.tables WHERE DATA_FREE / (DATA_LENGTH + INDEX_LENGTH) \u003e 0.3;` |\n| 34 | 没有主键的表 | 所有表应有 PRIMARY KEY | 高 | `SELECT t.table_schema, t.table_name FROM information_schema.tables t LEFT JOIN information_schema.table_constraints tc ON t.table_schema=tc.table_schema AND t.table_name=tc.table_name AND tc.constraint_type='PRIMARY KEY' WHERE t.table_type='BASE TABLE' AND tc.constraint_name IS NULL AND t.table_schema NOT IN ('information_schema','mysql','performance_schema','sys');` |\n| 35 | 大字段检查 | TEXT/BLOB/CLOB 超大字段告警 | 中 | `SELECT table_schema, table_name, column_name, data_type FROM information_schema.columns WHERE data_type IN ('tinytext','text','mediumtext','longtext','tinyblob','blob','mediumblob','longblob');` |\n| 36 | 特殊数据类型 | ENUM/SET 等限制型字段 | 低 | 同上查询过滤 enum/set |\n| 37 | 允许为 NULL 的字段 | 非业务必需字段不应 NULL | 低 | 查所有 nullable 列 |\n| 38 | 表名大小写敏感 | `lower_case_table_names` 检查 | 中 | `SHOW VARIABLES LIKE 'lower_case_table_names';` |\n| 39 | 非 UTF8 字符集 Top10 | 字符集非 utf8mb4 的表 Top10 | 中 | `SELECT table_schema, table_name, table_collation FROM information_schema.tables JOIN information_schema.columns USING (table_schema, table_name) WHERE table_type='BASE TABLE' AND table_collation NOT LIKE 'utf8%' AND table_schema NOT IN ('information_schema','mysql','performance_schema','sys') GROUP BY 1,2,3 ORDER BY COUNT(*) DESC LIMIT 10;` |\n| 40 | 使用分区表 | 分区表使用检查 | 中 | `SELECT table_schema, table_name FROM information_schema.tables WHERE partity_type IS NOT NULL;` |\n| 41 | 使用存储过程 | 存储过程数量统计 | 低 | `SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema NOT IN ('information_schema','mysql','performance_schema','sys');` |\n| 42 | 使用视图 | 视图数量统计 | 低 | `SELECT COUNT(*) FROM information_schema.views WHERE table_schema NOT IN ('information_schema','mysql','performance_schema','sys');` |\n\n### 八、运行状态 — 活跃会话信息\n\n- 当前活跃连接数、各状态分布（Sleep/Running/Slow/Locked）\n- 长事务/长查询 TOP10\n- 锁等待情况\n\n```sql\n-- 活跃会话\nSELECT STATEMENT, COUNT(*) FROM information_schema.processlist GROUP BY STATEMENT ORDER BY COUNT(*) DESC;\n\n-- 长查询\nSELECT * FROM information_schema.processlist WHERE TIME \u003e 60 ORDER BY TIME DESC LIMIT 10;\n```\n\n## 巡检执行流程\n\n### Step 1: 系统信息收集\n\n通过 swissql 连接目标 MySQL 实例，依次执行上述 SQL。每条 SQL 执行后记录：\n- 是否正常返回\n- 返回的实际值\n- 是否超阈值\n\n### Step 2: 异常判定与分级\n\n将每条检查结果与对应阈值比对，标记为：\n\n| 等级 | 说明 | 行动建议 |\n|------|------|----------|\n| 高 | 可能导致数据丢失、服务中断、安全泄露 | 必须立即处理 |\n| 中 | 影响性能或长期稳定性 | 建议在维护窗口处理 |\n| 低 | 配置不最优但不紧急 | 可纳入优化计划 |\n\n### Step 3: 生成巡检报告\n\n## 输出格式（固定结构）\n\n### 巡检结论\n\n| 指标 | 值 |\n|------|----|\n| 目标实例 | host:port / 连接名 |\n| MySQL 版本 | x.x.x |\n| 巡检时间 | YYYY-MM-DD HH:MM |\n| 总检查项 | 42 |\n| 异常项数 | N（高/中/低） |\n| 整体健康度 | 良好 / 一般 / 较差 / 危险 |\n\n### 异常项明细\n\n**【高】**\n\n| 序号 | 检查项 | 当前值 | 阈值/期望 | 风险描述 |\n|------|--------|--------|----------|----------|\n| ... | ... | ... | ... | ... |\n\n**【中】**\n\n（同上格式）\n\n**【低】**\n\n（同上格式）\n\n### 运行状态快照\n\n| 指标 | 值 |\n|------|----|\n| 活跃连接数 | N |\n| Sleep 连接数 | N |\n| 长查询数 | N |\n| 锁等待数 | N |\n| 复制延迟（秒） | N |\n\n### 建议\n\n逐条列出对应异常项的修复建议。\n\n## 安全边界\n\n- **只读**：仅执行 `SHOW`、`SELECT` 类只读操作\n- **不修改**：不执行任何 `SET`、`ALTER`、`GRANT`、`CREATE`、`DROP`、`UPDATE`、`DELETE`、`TRUNCATE`\n- **不清理**：不清理慢日志、错误日志、binlog\n- **不猜测**：查询失败就如实报告，禁止编造数据\n- **不跳过**：42 项检查逐项执行，不跳项、不省略\n\n## 异常处理\n\n| 异常场景 | 处理方式 |\n|----------|----------|\n| swissql 连接失败 | 报告\"无法连接目标实例\"，不自行排查网络 |\n| 部分 SQL 返回错误 | 记录为\"查询失败\"，继续执行剩余检查项 |\n| 权限不足 | 报告需要哪些权限，不尝试绕过 |\n| 目标非 MySQL 实例 | 报告\"目标实例非 MySQL\"，不强行执行 MySQL 巡检 |",
+      "createdAt": "2026-10-08T10:44:15.600139+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "MySQL 数据库例行巡检 skill，覆盖主机/系统层、InnoDB/存储引擎、日志/Binlog、连接/会话/缓存、复制/主从、安全/账户、对象/表结构、运行状态等 8 大类共 42 项检查。触发场景：mysql check、mysql 巡检、mysql health check、mysql 健康检查、mysql 例行巡检。对应方式：通过 swissql 执行只读 SQL/SHOW 命令。",
+      "id": "8bb34534-31ad-42b9-8b8f-afe1905265da",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#742dd2",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1d65d0fc-9aed-462f-8710-37dc0132b996",
+          "name": "mysql",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "db-mysql-check",
+      "updatedAt": "2026-10-08T10:44:15.600139+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": {
+        "origin": {
+          "type": "upload"
+        },
+        "source_type": "upload"
+      },
+      "content": "---\nname: db-swissql-connection-list\ndescription: 通过 swissql CLI 直查后端连接注册表，回答\"当前纳管了哪些数据库\"。当用户询问 SwissQL/Mopheus 纳管数据库清单、连接列表、数据库资产汇总时触发。禁止凭记忆或本地台账回答，必须实时查询。\nversion: v1.0.0\ntags: db-query\nparams:\n  - name: workspace_id\n    type: string\n    required: false\n    default: \"\"\n    desc: 目标工作区 UUID（隔离域），留空时自动发现当前激活工作区\nsupport_db: swissql\nsafe_level: query\nauthor: 团队出厂预置\nupdate_time: 2026-09-30\n---\n\n# SwissQL 纳管数据库连接清单查询\n\n## 单一职责\n\n仅通过 `swissql connections list` 直查后端连接注册表，输出当前纳管数据库连接的规范化清单。不执行 connections add / update / delete 等变更操作，不查询 Mopheus asset 列表（资产列表含历史冗余记录，与 SwissQL 实际纳管口径不一致）。\n\n## 为什么必须用本 Skill\n\n直接问智能体\"纳管了哪些数据库\"，每次回答都不一样，常见错误：\n\n- 凭训练记忆或本地台账文件回答，与实际注册表不符\n- 混入 Mopheus asset 列表中的历史/冗余记录\n- 输出格式随意，字段时多时少\n\n本 Skill 强制：**实时直查后端 + 固定输出格式**，同一份数据，同一个样子。\n\n## 执行逻辑\n\n### 1. 前置检查\n\n```bash\nswissql status\n```\n\n确认 CLI 与 backend 版本一致（0.5.0+）且 backend UP。backend DOWN 时状态=CRITICAL，提示先启动 SwissQL 服务（docker 容器名通常为 mopheus-swissql-1）。\n\n### 2. 确定隔离域（workspace_id）\n\nSwissQL 0.5.0+ 的 `connections list` 必须在隔离域（工作区）上下文下执行，否则报错。\n\n`workspace_id` 参数留空时，通过 Mopheus CLI 自动发现当前激活工作区：\n\n```bash\nmopheus workspace list\n```\n\n取当前激活（active）工作区的 UUID。用户明确指定工作区时，用指定值。\n\n### 3. 查询连接列表\n\n隔离域通过环境变量传入（`connections list` 不支持 `--isolation-domain` 参数）：\n\n```bash\nSWISSQL_AUDIT_LABEL=\"MOPHEUS_WORKSPACE_ID=${workspace_id}\" swissql connections list\n```\n\n如需 JSON 解析，追加 CLI 支持的输出格式参数（以 `swissql connections list --help` 为准）。\n\n### 4. 字段提取与归一化\n\n对每条连接提取并归一化：\n\n| 字段 | 说明 |\n|------|------|\n| 连接名 | name 原值 |\n| 类型 | db_type 归一化到标准类：Oracle / MySQL / TiDB / PostgreSQL / KingbaseES / 达梦 DM / OceanBase / Redis / 其他（自定义类型按注册名原样展示，注意别名不归并，ob 与 oceanbase 算两个条目需人工合并口径时单独标注） |\n| 地址 | host:port，有库名/service 则补充 /dbname |\n| 用户名 | 认证用户名（凭证内容绝不展示） |\n| enabled | true/false |\n| 凭证 | credential_configured 是否为 true，仅展示 已配置/未配置 |\n| 来源 | source（manual 等） |\n| 环境 | 环境标签（production/demo 等），无则填 - |\n\n### 5. 汇总统计\n\n- 连接总数、enabled=true 数量、凭证已配置数量\n- 按类型分组计数\n\n## 状态判定逻辑\n\n| 条件 | 状态 | 说明 |\n|------|------|------|\n| backend UP 且 connections list 成功返回 | HEALTHY | 正常输出清单 |\n| backend UP 但存在 enabled=false 或凭证未配置的连接 | DEGRADED | 清单正常输出，末尾标注异常连接 |\n| backend DOWN / CLI 与 backend 版本不一致 / 缺隔离域或 admin token 导致查询失败 | CRITICAL | 无法获取清单，提示修复方向 |\n\n## 输出格式（固定，不得变更结构）\n\n### 总览\n\n| 指标 | 值 |\n|------|----|\n| Backend 状态 | UP（CLI x.y.z） |\n| 连接总数 | N |\n| enabled=true | N |\n| 凭证已配置 | N |\n| 工作区 | \u003c工作区名\u003e |\n\n### 按类型汇总\n\n| 类型 | 数量 | 连接名 |\n|------|------|--------|\n| Oracle | n | name1、name2 |\n| MySQL | n | ... |\n\n### 连接明细（按类型分组）\n\n**Oracle（n 个）**\n\n| 名称 | IP:端口/库 | 模式 | 用户名 | 环境 |\n|------|-----------|------|--------|------|\n| ... | ... | ... | ... | ... |\n\n（每个类型一节，字段按该类型实际情况可含 模式/类型 列）\n\n### 异常提示（如有）\n\n| 连接名 | 问题 | 建议 |\n|--------|------|------|\n| ... | enabled=false / 凭证未配置 | ... |\n\n## 功能限制 / 安全边界\n\n- **只读**：仅执行 `swissql status`、`mopheus workspace list`、`swissql connections list`\n- **凭证脱敏**：任何情况下不输出密码、token、DSN 内嵌凭据，仅展示\"已配置/未配置\"\n- **口径一致**：以 SwissQL 后端注册表为唯一口径，不与 Mopheus asset 列表混用；如用户问两个口径差异，可说明 asset 列表含历史冗余记录\n- **不猜测**：查询失败就报 CRITICAL 并说明原因，禁止用历史结果或本地台账兜底\n\n## 结果验证\n\n- 明细表行数之和 = 总览中的连接总数\n- 分组汇总的数量之和 = 连接总数\n- 每条连接均含 名称/类型/地址/用户名 四要素\n- 输出中不包含任何明文凭据\n\n## 异常处理\n\n| 异常场景 | 处理方式 |\n|----------|----------|\n| `swissql` 命令不存在 | CRITICAL，提示 SwissQL CLI 未安装或不在 PATH（用户态部署常见于 ~/.local/bin） |\n| backend DOWN | CRITICAL，提示检查 docker 容器 mopheus-swissql-1 状态 |\n| 报缺少隔离域 / isolation domain | 检查 SWISSQL_AUDIT_LABEL 环境变量格式：`MOPHEUS_WORKSPACE_ID=\u003cuuid\u003e` |\n| 报需要 admin token | 从容器环境获取：`docker exec mopheus-swissql-1 printenv SWISSQL_ADMIN_TOKEN` |\n| 工作区下连接数为 0 | 如实输出 0 条，并提示可能选错工作区，列出可选工作区供确认 |\n| 自定义 db_type（tidb/ob/kingbase 等注册类型） | 按注册名原样归类展示，不折算、不合并 |\n",
+      "createdAt": "2026-09-30T16:22:09.101996+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "通过 swissql CLI 直查后端连接注册表，回答\"当前纳管了哪些数据库\"。当用户询问 SwissQL/Mopheus 纳管数据库清单、连接列表、数据库资产汇总时触发。禁止凭记忆或本地台账回答，必须实时查询。",
+      "id": "853fe0c3-61a2-4ec2-9589-eafd555955fb",
+      "name": "db-swissql-connection-list",
+      "updatedAt": "2026-09-30T16:22:09.101996+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": {
+        "source_type": "manual"
+      },
+      "content": "---\nname: mopheus-assets\ndescription: \"排查生产故障根因、分析服务依赖、评估爆炸半径、导入或程序化创建IT资产清单(manifest)、查询服务与基础设施部署关系时使用。/ Use when diagnosing production incidents, tracing dependencies, analyzing blast radius, creating or importing declarative IT asset manifests, or resolving infrastructure topology.\"\nuser-invocable: true\nallowed-tools: Bash(mop asset *), Bash(mopheus asset *)\nfeatures:\n  - asset\n---\n\n# IT Asset Ontology \u0026 Topology Analysis (`mopheus-assets`)\n\nUse this skill when investigating production alerts, tracing root causes across application architectures, identifying blast radius, inspecting CMDB infrastructure relationships, or declaring and importing IT asset manifests.\n\nMopheus models IT systems as an **ontology knowledge graph** governed by strong metamodels (TBox) and typed directed relations (ABox). Every asset is an explicit entity instance with a concept class, attributes, and canonical relationships.\n\n## 1. Core Principles\n\n1. **Entity Resolution First**: Do not guess hostnames, service names, or database instances. Always resolve human-friendly names or alert identifiers to canonical Asset IDs using `mop asset resolve`.\n2. **Directional Topology Awareness**:\n   - **Downstream** (`app -\u003e service -\u003e db -\u003e host`): Use when determining architecture composition, deployments, and dependency propagation.\n   - **Upstream** (`host -\u003e db -\u003e service -\u003e app`): Use when diagnosing infrastructure failure impact (e.g. \"If host-01 fails, which applications go down?\").\n   - **Both**: Comprehensive blast radius and boundary mapping.\n3. **Deterministic Causal Path**: Use `mop asset path` to find the shortest causal chain between a symptom entity (e.g., failed service) and a suspect root cause entity (e.g., degraded physical node).\n4. **Agent-Native Declarative Ingestion**: The `AssetManifest` YAML structure has strict schema validation and topology axioms. It is designed for AI agents to synthesize programmatically after inspecting concepts, NOT for human manual handcrafting. Always consult the bundled references before synthesizing:\n   - Specification: `references/manifest-spec.md`\n   - Canonical Template: `references/manifest-template.yaml`\n\n## 2. Standard Operating Procedures (SOP)\n\n### Step 1: Entity Resolution \u0026 Inspection\nWhen given an entity name, alias, IP, or service slug:\n```bash\n# Resolve exact asset identity from name or alias\nmop asset resolve \"order-gateway\"\n\n# Inspect detailed attributes, labels, and concept schema\nmop asset inspect \"svc:order-gateway\"\n```\n\n### Step 2: Topology Drill-Down \u0026 Dependency Tracing\nTo understand the environment around the asset:\n```bash\n# Downstream dependencies (what does this asset depend on or run on?)\nmop asset topology \"svc:order-gateway\" --depth 3 --direction downstream\n\n# Upstream blast radius (what depends on this infrastructure node?)\nmop asset topology \"host:db-node-01\" --depth 3 --direction upstream\n\n# Full bidirectional context\nmop asset topology \"db:settle-oracle-rac\" --depth 2 --direction both\n```\n\n### Step 3: Causal Root Cause Path Finding\nWhen an incident occurs between two correlated components:\n```bash\n# Find shortest causal path from symptom to root cause\nmop asset path --from \"svc:order-gateway\" --to \"host:db-node-01\" --max-depth 5\n```\n\n### Step 4: Declarative Asset Manifest Creation \u0026 Ingestion\nWhen registering, importing, or updating IT assets and relationships:\n1. **Inspect Concept Metamodel**: Check required attributes and allowed relations:\n   ```bash\n   mop asset concept get Host\n   mop asset concept get Service\n   mop asset concept get Database\n   ```\n2. **Read Reference Template**: Consult `references/manifest-template.yaml` and `references/manifest-spec.md` for exact YAML syntax.\n3. **Synthesize Manifest YAML**: Programmatically generate the YAML file (e.g. `/tmp/asset-manifest.yaml`). Ensure:\n   - Physical nodes (`Host`, `DatabaseInstance`) specify `credential_ref: \"ssh://user@ip:port?key=keyName\"` when remote access is required.\n   - Logical services (`Service`, `Database`) link to physical nodes via `runs_on` edges.\n   - Relations only use the 7 canonical predicates (`contains`, `runs_on`, `routes_to`, `depends_on`, `replicates_to`, `clustered_with`, `manages`).\n4. **Apply Manifest**:\n   ```bash\n   mop asset apply -f /tmp/asset-manifest.yaml\n   ```\n5. **Verify Ingested Assets**:\n   ```bash\n   mop asset list --env prod\n   mop asset inspect host:k8s-worker-01\n   ```\n\n### Step 5: Architecture Diagram Visualization\nWhen presenting or reviewing system architecture:\n```bash\n# View L1 workspace application architecture overview table\nmop asset diagram\n\n# Generate L2 detailed 4-tier architecture spec as Archify JSON\nmop asset diagram --app \"app:mopheus\" -o json\n\n# Render standalone interactive Archify HTML diagram\nmop asset diagram --app \"app:mopheus\" --render -f mopheus-arch.html\n```\n\n",
+      "createdAt": "2026-09-24T16:23:18.458782+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "排查生产故障根因、分析服务依赖、评估爆炸半径、导入或程序化创建IT资产清单(manifest)、查询服务与基础设施部署关系时使用。/ Use when diagnosing production incidents, tracing dependencies, analyzing blast radius, creating or importing declarative IT asset manifests, or resolving infrastructure topology.",
+      "id": "c04eed60-cf21-413c-8158-2db5dcfe9d6a",
+      "labels": [
+        {
+          "color": "#d22da3",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "250ec627-0e03-4e4a-b424-557619522d59",
+          "name": "assets",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "mopheus-assets",
+      "updatedAt": "2026-09-24T16:23:18.458782+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: zk_get_status\ndescription: '[MW-037][感知][L1][免费+] 获取 ZooKeeper 节点状态（模式、连接数、延迟、znode 数）。 触发场景：zk get status、echo stat | nc。对应命令/接口：echo stat | nc。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# zk_get_status · 感知\n\n- **Skill ID**: MW-037\n- **名称（LLM 调用）**: `zk_get_status`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `echo stat | nc`\n\n## 用途\n\n获取 ZooKeeper 节点状态（模式、连接数、延迟、znode 数）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：echo stat | nc\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 Mode（leader/follower）、Outstanding 与延迟。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.288467+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-037][感知][L1][免费+] 获取 ZooKeeper 节点状态（模式、连接数、延迟、znode 数）。 触发场景：zk get status、echo stat | nc。对应命令/接口：echo stat | nc。",
+      "id": "de819107-6354-4b0c-b1ea-ca4fce289a53",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#12d8f3",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "41a4dc54-c509-4cba-be78-8e4b7e2220e1",
+          "name": "zk",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "zk_get_status",
+      "updatedAt": "2026-09-24T15:55:29.930199+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: zk_get_leader\ndescription: '[MW-038][感知][L1][免费+] 识别 ZooKeeper 集群 leader 与 follower 分布。 触发场景：zk get leader、echo stat | nc。对应命令/接口：echo stat | nc。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# zk_get_leader · 感知\n\n- **Skill ID**: MW-038\n- **名称（LLM 调用）**: `zk_get_leader`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `echo stat | nc`\n\n## 用途\n\n识别 ZooKeeper 集群 leader 与 follower 分布。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：echo stat | nc\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 确认是否存在多 leader 或选举频繁。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.282897+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-038][感知][L1][免费+] 识别 ZooKeeper 集群 leader 与 follower 分布。 触发场景：zk get leader、echo stat | nc。对应命令/接口：echo stat | nc。",
+      "id": "a4f93859-bff8-41a3-97ba-be817e6ba02b",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#12d8f3",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "41a4dc54-c509-4cba-be78-8e4b7e2220e1",
+          "name": "zk",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "zk_get_leader",
+      "updatedAt": "2026-09-24T15:55:29.921629+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: tomcat_get_status\ndescription: '[MW-033][感知][L1][免费+] 获取 Tomcat 运行状态（JVM 内存、线程、请求处理）。 触发场景：tomcat get status、curl manager/status。对应命令/接口：curl manager/status。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# tomcat_get_status · 感知\n\n- **Skill ID**: MW-033\n- **名称（LLM 调用）**: `tomcat_get_status`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `curl manager/status`\n\n## 用途\n\n获取 Tomcat 运行状态（JVM 内存、线程、请求处理）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：curl manager/status\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注线程池繁忙度与 GC 相关指标。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.273783+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-033][感知][L1][免费+] 获取 Tomcat 运行状态（JVM 内存、线程、请求处理）。 触发场景：tomcat get status、curl manager/status。对应命令/接口：curl manager/status。",
+      "id": "824d35b1-3eca-47a3-ab67-3fdc43ca6905",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "dfadb280-0415-4ee6-8c16-79dcc59ae6d4",
+          "name": "tomcat",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "tomcat_get_status",
+      "updatedAt": "2026-09-24T15:55:29.912407+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: tomcat_get_sessions\ndescription: '[MW-034][感知][L1][免费+] 查看 Tomcat 会话列表与数量。 触发场景：tomcat get sessions、manager/sessions。对应命令/接口：manager/sessions。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# tomcat_get_sessions · 感知\n\n- **Skill ID**: MW-034\n- **名称（LLM 调用）**: `tomcat_get_sessions`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `manager/sessions`\n\n## 用途\n\n查看 Tomcat 会话列表与数量。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：manager/sessions\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 会话异常增长可能提示内存泄漏或攻击。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.264973+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-034][感知][L1][免费+] 查看 Tomcat 会话列表与数量。 触发场景：tomcat get sessions、manager/sessions。对应命令/接口：manager/sessions。",
+      "id": "9947e095-568c-4a82-8a62-7997426d0bf3",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "dfadb280-0415-4ee6-8c16-79dcc59ae6d4",
+          "name": "tomcat",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "tomcat_get_sessions",
+      "updatedAt": "2026-09-24T15:55:29.902466+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: redis_get_slowlog\ndescription: '[MW-019][感知][L1][免费+] 获取慢查询日志，定位高耗时命令。 触发场景：redis get slowlog、redis-cli SLOWLOG GET。对应命令/接口：redis-cli SLOWLOG GET。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# redis_get_slowlog · 感知\n\n- **Skill ID**: MW-019\n- **名称（LLM 调用）**: `redis_get_slowlog`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `redis-cli SLOWLOG GET`\n\n## 用途\n\n获取慢查询日志，定位高耗时命令。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n| `count` | 否 | 10 | 返回条数（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：redis-cli SLOWLOG GET\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 结合 slowlog-log-slower-than 阈值判读。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.259126+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-019][感知][L1][免费+] 获取慢查询日志，定位高耗时命令。 触发场景：redis get slowlog、redis-cli SLOWLOG GET。对应命令/接口：redis-cli SLOWLOG GET。",
+      "id": "420827fb-0ec8-4a35-b323-75b0fa51aacc",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "7e273bca-b41a-432f-ad88-f706604e30d4",
+          "name": "redis",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "redis_get_slowlog",
+      "updatedAt": "2026-09-24T15:55:29.893755+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: redis_get_memory\ndescription: '[MW-020][感知][L1][免费+] 获取内存使用明细与碎片率。 触发场景：redis get memory、redis-cli INFO memory。对应命令/接口：redis-cli INFO memory。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# redis_get_memory · 感知\n\n- **Skill ID**: MW-020\n- **名称（LLM 调用）**: `redis_get_memory`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `redis-cli INFO memory`\n\n## 用途\n\n获取内存使用明细与碎片率。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：redis-cli INFO memory\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- mem_fragmentation_ratio 长期 \u003e1.5 需关注。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.252007+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-020][感知][L1][免费+] 获取内存使用明细与碎片率。 触发场景：redis get memory、redis-cli INFO memory。对应命令/接口：redis-cli INFO memory。",
+      "id": "a9283af9-939a-4cae-aaf3-e20399d9189b",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "7e273bca-b41a-432f-ad88-f706604e30d4",
+          "name": "redis",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "redis_get_memory",
+      "updatedAt": "2026-09-24T15:55:29.886146+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: redis_get_info\ndescription: '[MW-017][感知][L1][免费+] 获取 Redis INFO 全量信息（server/clients/memory/stats/replication）。 触发场景：redis get info、redis-cli INFO。对应命令/接口：redis-cli INFO。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# redis_get_info · 感知\n\n- **Skill ID**: MW-017\n- **名称（LLM 调用）**: `redis_get_info`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `redis-cli INFO`\n\n## 用途\n\n获取 Redis INFO 全量信息（server/clients/memory/stats/replication）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：redis-cli INFO\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 connected_clients、used_memory、evicted_keys、rejected_connections。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.244739+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-017][感知][L1][免费+] 获取 Redis INFO 全量信息（server/clients/memory/stats/replication）。 触发场景：redis get info、redis-cli INFO。对应命令/接口：redis-cli INFO。",
+      "id": "1fbc2b22-268d-4cfa-923f-e6ea70de14f8",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "7e273bca-b41a-432f-ad88-f706604e30d4",
+          "name": "redis",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "redis_get_info",
+      "updatedAt": "2026-09-24T15:55:29.876851+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: redis_get_client_list\ndescription: '[MW-021][感知][L1][免费+] 列出当前客户端连接，定位异常来源与空闲连接。 触发场景：redis get client list、redis-cli CLIENT LIST。对应命令/接口：redis-cli CLIENT LIST。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# redis_get_client_list · 感知\n\n- **Skill ID**: MW-021\n- **名称（LLM 调用）**: `redis_get_client_list`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `redis-cli CLIENT LIST`\n\n## 用途\n\n列出当前客户端连接，定位异常来源与空闲连接。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：redis-cli CLIENT LIST\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 addr、age、idle、cmd 与 name。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.237958+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-021][感知][L1][免费+] 列出当前客户端连接，定位异常来源与空闲连接。 触发场景：redis get client list、redis-cli CLIENT LIST。对应命令/接口：redis-cli CLIENT LIST。",
+      "id": "31364cbf-0980-4912-b0d5-04d481342c99",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "7e273bca-b41a-432f-ad88-f706604e30d4",
+          "name": "redis",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "redis_get_client_list",
+      "updatedAt": "2026-09-24T15:55:29.863858+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: redis_get_bigkeys\ndescription: '[MW-018][感知][L1][免费+] 扫描大 key，定位内存与慢查询隐患。 触发场景：redis get bigkeys、redis-cli --bigkeys。对应命令/接口：redis-cli --bigkeys。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# redis_get_bigkeys · 感知\n\n- **Skill ID**: MW-018\n- **名称（LLM 调用）**: `redis_get_bigkeys`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `redis-cli --bigkeys`\n\n## 用途\n\n扫描大 key，定位内存与慢查询隐患。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：redis-cli --bigkeys\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 扫描有性能开销，建议低峰执行；仅统计不删除。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.230848+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-018][感知][L1][免费+] 扫描大 key，定位内存与慢查询隐患。 触发场景：redis get bigkeys、redis-cli --bigkeys。对应命令/接口：redis-cli --bigkeys。",
+      "id": "cfe87105-0626-4ae1-b4db-4d41b4292e0f",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "7e273bca-b41a-432f-ad88-f706604e30d4",
+          "name": "redis",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "redis_get_bigkeys",
+      "updatedAt": "2026-09-24T15:55:29.855323+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_tail_log\ndescription: '[OS-009][感知][L1][免费+] 读取日志文件末尾 N 行，用于故障现场取证。 触发场景：os tail log、tail -n100。对应命令/接口：tail -n100。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_tail_log · 感知\n\n- **Skill ID**: OS-009\n- **名称（LLM 调用）**: `os_tail_log`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `tail -n100`\n\n## 用途\n\n读取日志文件末尾 N 行，用于故障现场取证。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `log_path` | 是 | — | 日志文件绝对路径 |\n| `lines` | 否 | 100 | 读取行数（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：tail -n100\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 只读；注意日志可能含敏感信息，输出需脱敏。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.22642+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-009][感知][L1][免费+] 读取日志文件末尾 N 行，用于故障现场取证。 触发场景：os tail log、tail -n100。对应命令/接口：tail -n100。",
+      "id": "8906a8dc-4456-4791-8fed-707bb90a43f8",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_tail_log",
+      "updatedAt": "2026-09-24T15:55:29.844355+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_list_services\ndescription: '[OS-014][感知][L1][免费+] 列出全部 systemd 单元及其状态。 触发场景：os list services、systemctl list-units。对应命令/接口：systemctl list-units。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_list_services · 感知\n\n- **Skill ID**: OS-014\n- **名称（LLM 调用）**: `os_list_services`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `systemctl list-units`\n\n## 用途\n\n列出全部 systemd 单元及其状态。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：systemctl list-units\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 用于盘点 failed 单元与自启项。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.220714+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-014][感知][L1][免费+] 列出全部 systemd 单元及其状态。 触发场景：os list services、systemctl list-units。对应命令/接口：systemctl list-units。",
+      "id": "201400d8-4581-4d96-b952-4cccfd845a9e",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_list_services",
+      "updatedAt": "2026-09-24T15:55:29.837156+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_kill_process\ndescription: '[OS-017][执行-低危][L3-低][基础+] 向指定进程发送 SIGTERM（默认 15）优雅终止。 触发场景：os kill process、kill -15 [pid]。对应命令/接口：kill -15 [pid]。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_kill_process · 执行-低危\n\n- **Skill ID**: OS-017\n- **名称（LLM 调用）**: `os_kill_process`\n- **类别**: 执行-低危\n- **风险等级**: L3-低\n- **所需订阅包**: 基础+\n- **输出格式**: {result}\n- **对应命令/接口**: `kill -15 [pid]`\n\n## 用途\n\n向指定进程发送 SIGTERM（默认 15）优雅终止。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `pid` | 是 | — | 进程 PID |\n| `signal` | 否 | 15 | 信号值（15=SIGTERM 优雅，9=SIGKILL 强制） |\n\n## 执行\n\n```bash\n# 对应命令/接口：kill -15 [pid]\n```\n\n## 输出\n\n以 **{result}** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n低危执行：可直接执行，执行后留痕。\n\n## 校验与判读要点\n\n- 先确认 PID 与进程身份；优先优雅终止，观察是否自行退出。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.212268+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-017][执行-低危][L3-低][基础+] 向指定进程发送 SIGTERM（默认 15）优雅终止。 触发场景：os kill process、kill -15 [pid]。对应命令/接口：kill -15 [pid]。",
+      "id": "ce1f0a89-f942-4ff4-ac4c-7b53b573b52b",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "76e9e74e-0e5e-4a72-b302-716576f64caf",
+          "name": "基础+",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0acd887d-cbb6-4f91-bea0-a55142d46830",
+          "name": "执行-低危",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_kill_process",
+      "updatedAt": "2026-09-24T15:55:29.829669+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_grep_log\ndescription: '[OS-010][感知][L1][免费+] 按关键字检索日志（支持正则），定位报错与异常。 触发场景：os grep log、grep [keyword]。对应命令/接口：grep [keyword]。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_grep_log · 感知\n\n- **Skill ID**: OS-010\n- **名称（LLM 调用）**: `os_grep_log`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `grep [keyword]`\n\n## 用途\n\n按关键字检索日志（支持正则），定位报错与异常。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `log_path` | 是 | — | 日志文件绝对路径 |\n| `keyword` | 是 | — | 检索关键字（支持正则） |\n\n## 执行\n\n```bash\n# 对应命令/接口：grep [keyword]\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 建议配合时间窗与上下文行数（-C）缩小范围，避免全量扫描。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.208722+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-010][感知][L1][免费+] 按关键字检索日志（支持正则），定位报错与异常。 触发场景：os grep log、grep [keyword]。对应命令/接口：grep [keyword]。",
+      "id": "524e67e9-b1d7-4f4e-822a-53d519e8832c",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_grep_log",
+      "updatedAt": "2026-09-24T15:55:29.819388+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_uptime\ndescription: '[OS-015][感知][L1][免费+] 获取系统连续运行时长。 触发场景：os get uptime、uptime。对应命令/接口：uptime。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_uptime · 感知\n\n- **Skill ID**: OS-015\n- **名称（LLM 调用）**: `os_get_uptime`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `uptime`\n\n## 用途\n\n获取系统连续运行时长。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：uptime\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 异常重启排查：uptime 与计划外重启记录交叉验证。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.204394+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-015][感知][L1][免费+] 获取系统连续运行时长。 触发场景：os get uptime、uptime。对应命令/接口：uptime。",
+      "id": "39261517-0d5d-4ae3-8c6d-c903d28fb8b5",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_uptime",
+      "updatedAt": "2026-09-24T15:55:29.811661+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_process_list\ndescription: '[OS-005][感知][L1][免费+] 获取进程列表（可按关键字过滤），用于定位异常进程与僵尸进程。 触发场景：os get process list、ps aux。对应命令/接口：ps aux。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_process_list · 感知\n\n- **Skill ID**: OS-005\n- **名称（LLM 调用）**: `os_get_process_list`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `ps aux`\n\n## 用途\n\n获取进程列表（可按关键字过滤），用于定位异常进程与僵尸进程。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `filter` | 是 | — | 进程过滤关键字（如 java / nginx） |\n\n## 执行\n\n```bash\n# 对应命令/接口：ps aux\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 STAT 中的 Z（僵尸）、D（不可中断 IO）与异常常驻内存。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.200568+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-005][感知][L1][免费+] 获取进程列表（可按关键字过滤），用于定位异常进程与僵尸进程。 触发场景：os get process list、ps aux。对应命令/接口：ps aux。",
+      "id": "0f1c439a-111f-496b-b6cc-9f46ab97bcc9",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_process_list",
+      "updatedAt": "2026-09-24T15:55:29.801469+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_os_version\ndescription: '[OS-011][感知][L1][免费+] 获取操作系统发行版与版本号。 触发场景：os get os version、cat /etc/os-release。对应命令/接口：cat /etc/os-release。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_os_version · 感知\n\n- **Skill ID**: OS-011\n- **名称（LLM 调用）**: `os_get_os_version`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `cat /etc/os-release`\n\n## 用途\n\n获取操作系统发行版与版本号。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：cat /etc/os-release\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 用于判断命令/包管理器差异（yum vs apt）。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.193234+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-011][感知][L1][免费+] 获取操作系统发行版与版本号。 触发场景：os get os version、cat /etc/os-release。对应命令/接口：cat /etc/os-release。",
+      "id": "d7fcc759-aec0-4ca1-b5b2-b081750a31d4",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_os_version",
+      "updatedAt": "2026-09-24T15:55:29.791089+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_network_stat\ndescription: '[OS-007][感知][L1][免费+] 获取网卡收发与错误/丢包统计。 触发场景：os get network stat、netstat -i。对应命令/接口：netstat -i。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_network_stat · 感知\n\n- **Skill ID**: OS-007\n- **名称（LLM 调用）**: `os_get_network_stat`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `netstat -i`\n\n## 用途\n\n获取网卡收发与错误/丢包统计。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：netstat -i\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 RX-ERR / TX-ERR / RX-DRP / TX-DRP 是否持续增长。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.189542+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-007][感知][L1][免费+] 获取网卡收发与错误/丢包统计。 触发场景：os get network stat、netstat -i。对应命令/接口：netstat -i。",
+      "id": "c307277f-2005-4dc7-bc01-f5d18f954c1d",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_network_stat",
+      "updatedAt": "2026-09-24T15:55:29.783892+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_memory\ndescription: '[OS-002][感知][L1][免费+] 获取内存使用情况（总量/已用/可用/缓存/swap）。 触发场景：os get memory、free -m。对应命令/接口：free -m。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_memory · 感知\n\n- **Skill ID**: OS-002\n- **名称（LLM 调用）**: `os_get_memory`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `free -m`\n\n## 用途\n\n获取内存使用情况（总量/已用/可用/缓存/swap）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：free -m\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 可用内存需扣掉 buff/cache 判断真实余量；swap 大量使用提示内存压力。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.185296+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-002][感知][L1][免费+] 获取内存使用情况（总量/已用/可用/缓存/swap）。 触发场景：os get memory、free -m。对应命令/接口：free -m。",
+      "id": "884d75ec-806f-457b-b0ee-58cec05ebdb6",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_memory",
+      "updatedAt": "2026-09-24T15:55:29.778426+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_load_avg\ndescription: '[OS-008][感知][L1][免费+] 获取 1/5/15 分钟平均负载与运行时长。 触发场景：os get load avg、uptime。对应命令/接口：uptime。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_load_avg · 感知\n\n- **Skill ID**: OS-008\n- **名称（LLM 调用）**: `os_get_load_avg`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `uptime`\n\n## 用途\n\n获取 1/5/15 分钟平均负载与运行时长。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：uptime\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 负载需与 CPU 核数比较；1 分钟高而 15 分钟低说明突发。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.180885+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-008][感知][L1][免费+] 获取 1/5/15 分钟平均负载与运行时长。 触发场景：os get load avg、uptime。对应命令/接口：uptime。",
+      "id": "ac19c2ce-cb15-4a7b-abf6-a7fc9c5d27e4",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_load_avg",
+      "updatedAt": "2026-09-24T15:55:29.775008+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_kernel_version\ndescription: '[OS-012][感知][L1][免费+] 获取内核版本与架构信息。 触发场景：os get kernel version、uname -a。对应命令/接口：uname -a。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_kernel_version · 感知\n\n- **Skill ID**: OS-012\n- **名称（LLM 调用）**: `os_get_kernel_version`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `uname -a`\n\n## 用途\n\n获取内核版本与架构信息。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：uname -a\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 内核升级、参数调优与驱动问题排查的前置信息。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.169852+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-012][感知][L1][免费+] 获取内核版本与架构信息。 触发场景：os get kernel version、uname -a。对应命令/接口：uname -a。",
+      "id": "3840f902-b86d-4c4a-a770-6d961650975c",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_kernel_version",
+      "updatedAt": "2026-09-24T15:55:29.768771+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_io_stat\ndescription: '[OS-006][感知][L1][免费+] 获取磁盘 IO 扩展统计（iostat -x）。 触发场景：os get io stat、iostat -x。对应命令/接口：iostat -x。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_io_stat · 感知\n\n- **Skill ID**: OS-006\n- **名称（LLM 调用）**: `os_get_io_stat`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `iostat -x`\n\n## 用途\n\n获取磁盘 IO 扩展统计（iostat -x）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：iostat -x\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 %util 接近 100%、await 明显升高、aqu-sz 队列堆积。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.163845+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-006][感知][L1][免费+] 获取磁盘 IO 扩展统计（iostat -x）。 触发场景：os get io stat、iostat -x。对应命令/接口：iostat -x。",
+      "id": "4effa9c3-33f2-4387-a18d-c76fec653a4d",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_io_stat",
+      "updatedAt": "2026-09-24T15:55:29.76021+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_inode\ndescription: '[OS-004][感知][L1][免费+] 获取各挂载点 inode 使用率。 触发场景：os get inode、df -i。对应命令/接口：df -i。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_inode · 感知\n\n- **Skill ID**: OS-004\n- **名称（LLM 调用）**: `os_get_inode`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `df -i`\n\n## 用途\n\n获取各挂载点 inode 使用率。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：df -i\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 磁盘有空间但无法创建文件时通常是 inode 耗尽（小文件堆积）。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.158508+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-004][感知][L1][免费+] 获取各挂载点 inode 使用率。 触发场景：os get inode、df -i。对应命令/接口：df -i。",
+      "id": "7566f08c-1235-4f6a-9b56-25af763283db",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_inode",
+      "updatedAt": "2026-09-24T15:55:29.751388+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_firewall_rules\ndescription: '[OS-016][感知][L1][免费+] 读取本机防火墙规则链。 触发场景：os get firewall rules、iptables -L。对应命令/接口：iptables -L。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_firewall_rules · 感知\n\n- **Skill ID**: OS-016\n- **名称（LLM 调用）**: `os_get_firewall_rules`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `iptables -L`\n\n## 用途\n\n读取本机防火墙规则链。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：iptables -L\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 只读；变更规则属网络团队职责，本团队仅取证。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.153237+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-016][感知][L1][免费+] 读取本机防火墙规则链。 触发场景：os get firewall rules、iptables -L。对应命令/接口：iptables -L。",
+      "id": "15fa8853-10d3-4dfa-bb09-ebe1ec8438ce",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_firewall_rules",
+      "updatedAt": "2026-09-24T15:55:29.744688+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_disk\ndescription: '[OS-003][感知][L1][免费+] 获取各挂载点磁盘使用率。 触发场景：os get disk、df -h。对应命令/接口：df -h。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_disk · 感知\n\n- **Skill ID**: OS-003\n- **名称（LLM 调用）**: `os_get_disk`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `df -h`\n\n## 用途\n\n获取各挂载点磁盘使用率。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：df -h\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注接近 100% 的挂载点；/var、/tmp、数据盘优先。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.149502+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-003][感知][L1][免费+] 获取各挂载点磁盘使用率。 触发场景：os get disk、df -h。对应命令/接口：df -h。",
+      "id": "46b84e0f-e611-412a-8c21-d6d21671512b",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_disk",
+      "updatedAt": "2026-09-24T15:55:29.736103+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_get_cpu_top\ndescription: '[OS-001][感知][L1][免费+] 获取 CPU 占用 Top N 的进程快照，用于定位 CPU 热点。 触发场景：os get cpu top、top -b -n1。对应命令/接口：top -b -n1。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_get_cpu_top · 感知\n\n- **Skill ID**: OS-001\n- **名称（LLM 调用）**: `os_get_cpu_top`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `top -b -n1`\n\n## 用途\n\n获取 CPU 占用 Top N 的进程快照，用于定位 CPU 热点。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `top_n` | 否 | 5 | 返回前 N 个进程（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：top -b -n1\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 %us/%sy/%wa 与 top 进程的 CPU/内存占比；%wa 高通常指向磁盘 IO 瓶颈。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.145626+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-001][感知][L1][免费+] 获取 CPU 占用 Top N 的进程快照，用于定位 CPU 热点。 触发场景：os get cpu top、top -b -n1。对应命令/接口：top -b -n1。",
+      "id": "aae79710-6499-4c80-81ad-fc74da645ed1",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_get_cpu_top",
+      "updatedAt": "2026-09-24T15:55:29.726532+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: os_check_service\ndescription: '[OS-013][感知][L1][免费+] 查看指定 systemd 服务的运行状态与最近日志。 触发场景：os check service、systemctl status [service]。对应命令/接口：systemctl status [service]。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# os_check_service · 感知\n\n- **Skill ID**: OS-013\n- **名称（LLM 调用）**: `os_check_service`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `systemctl status [service]`\n\n## 用途\n\n查看指定 systemd 服务的运行状态与最近日志。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `service_name` | 是 | — | systemd 服务名（如 nginx、sshd） |\n\n## 执行\n\n```bash\n# 对应命令/接口：systemctl status [service]\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注 active (running)/failed 与 Main PID、重启次数。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.136658+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[OS-013][感知][L1][免费+] 查看指定 systemd 服务的运行状态与最近日志。 触发场景：os check service、systemctl status [service]。对应命令/接口：systemctl status [service]。",
+      "id": "a34ec14a-bc12-495b-920a-2ef22caf4fcd",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "0c6f7aac-926e-48c5-ac9e-048327cf1fb6",
+          "name": "os",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "os_check_service",
+      "updatedAt": "2026-09-24T15:55:29.717361+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: nginx_get_status\ndescription: '[MW-001][感知][L1][免费+] 获取 Nginx stub_status 总览（活跃连接、accepts、handled、requests），用于健康巡检与容量判断。 触发场景：nginx get status、curl nginx_status。对应命令/接口：curl nginx_status。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# nginx_get_status · 感知\n\n- **Skill ID**: MW-001\n- **名称（LLM 调用）**: `nginx_get_status`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `curl nginx_status`\n\n## 用途\n\n获取 Nginx stub_status 总览（活跃连接、accepts、handled、requests），用于健康巡检与容量判断。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：curl nginx_status\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 对比 handled/accepts 判断是否丢连接；requests 增速用于估算 QPS。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.132714+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-001][感知][L1][免费+] 获取 Nginx stub_status 总览（活跃连接、accepts、handled、requests），用于健康巡检与容量判断。 触发场景：nginx get status、curl nginx_status。对应命令/接口：curl nginx_status。",
+      "id": "66a5ab9e-2bf3-45ef-a1c6-733d987cb589",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "c1406526-daa6-43a3-8983-fa29e123f3fb",
+          "name": "nginx",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "nginx_get_status",
+      "updatedAt": "2026-09-24T15:55:29.709402+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: nginx_get_connections\ndescription: '[MW-002][感知][L1][免费+] 获取 Nginx 连接明细（Active / Reading / Writing / Waiting），定位连接堆积与慢客户端。 触发场景：nginx get connections、curl nginx_status/connections。对应命令/接口：curl nginx_status/connections。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# nginx_get_connections · 感知\n\n- **Skill ID**: MW-002\n- **名称（LLM 调用）**: `nginx_get_connections`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `curl nginx_status/connections`\n\n## 用途\n\n获取 Nginx 连接明细（Active / Reading / Writing / Waiting），定位连接堆积与慢客户端。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：curl nginx_status/connections\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- Waiting 偏高通常为 keepalive 正常态；Writing 长期偏高提示后端慢。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.130003+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-002][感知][L1][免费+] 获取 Nginx 连接明细（Active / Reading / Writing / Waiting），定位连接堆积与慢客户端。 触发场景：nginx get connections、curl nginx_status/connections。对应命令/接口：curl nginx_status/connections。",
+      "id": "bb38fedb-f0bb-475f-9966-65533db737ae",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "c1406526-daa6-43a3-8983-fa29e123f3fb",
+          "name": "nginx",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "nginx_get_connections",
+      "updatedAt": "2026-09-24T15:55:29.697454+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: nginx_get_config\ndescription: '[MW-003][感知][L1][免费+] 读取 Nginx 主配置与 include 配置，用于核对 upstream、server、location 与超时设置。 触发场景：nginx get config、cat nginx.conf。对应命令/接口：cat nginx.conf。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# nginx_get_config · 感知\n\n- **Skill ID**: MW-003\n- **名称（LLM 调用）**: `nginx_get_config`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `cat nginx.conf`\n\n## 用途\n\n读取 Nginx 主配置与 include 配置，用于核对 upstream、server、location 与超时设置。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：cat nginx.conf\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 只读；输出中如含密钥或证书路径需脱敏。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.124104+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-003][感知][L1][免费+] 读取 Nginx 主配置与 include 配置，用于核对 upstream、server、location 与超时设置。 触发场景：nginx get config、cat nginx.conf。对应命令/接口：cat nginx.conf。",
+      "id": "45b576a2-d92c-4085-a5c1-ea01da818d78",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "c1406526-daa6-43a3-8983-fa29e123f3fb",
+          "name": "nginx",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "nginx_get_config",
+      "updatedAt": "2026-09-24T15:55:29.692906+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_traceroute\ndescription: '[NET-002][感知][L1][免费+] 路由路径追踪，定位中间跳点异常。 触发场景：net traceroute、traceroute。对应命令/接口：traceroute。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_traceroute · 感知\n\n- **Skill ID**: NET-002\n- **名称（LLM 调用）**: `net_traceroute`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `traceroute`\n\n## 用途\n\n路由路径追踪，定位中间跳点异常。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `target_ip` | 是 | — | 目标 IP 或域名 |\n| `max_hops` | 否 | 30 | 最大跳数（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：traceroute\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注某跳起持续高延迟或超时，判断是链路还是目标侧问题。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.11696+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-002][感知][L1][免费+] 路由路径追踪，定位中间跳点异常。 触发场景：net traceroute、traceroute。对应命令/接口：traceroute。",
+      "id": "62955689-f8ca-45dd-a9ea-bbfc128a25bd",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_traceroute",
+      "updatedAt": "2026-09-24T15:55:29.690173+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_resolve_dns\ndescription: '[NET-004][感知][L1][免费+] 域名解析查询（A/CNAME/NS 等）。 触发场景：net resolve dns、dig / nslookup。对应命令/接口：dig / nslookup。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_resolve_dns · 感知\n\n- **Skill ID**: NET-004\n- **名称（LLM 调用）**: `net_resolve_dns`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `dig / nslookup`\n\n## 用途\n\n域名解析查询（A/CNAME/NS 等）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `domain_name` | 是 | — | 待解析域名 |\n\n## 执行\n\n```bash\n# 对应命令/接口：dig / nslookup\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 对比多个 DNS 服务器结果，识别解析漂移或缓存不一致。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.109638+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-004][感知][L1][免费+] 域名解析查询（A/CNAME/NS 等）。 触发场景：net resolve dns、dig / nslookup。对应命令/接口：dig / nslookup。",
+      "id": "bf27d58d-bec4-4cbd-958a-2657da37876a",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_resolve_dns",
+      "updatedAt": "2026-09-24T15:55:29.687572+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_ping\ndescription: '[NET-001][感知][L1][免费+] ICMP 连通性与丢包/延迟探测。 触发场景：net ping、ping -c4。对应命令/接口：ping -c4。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_ping · 感知\n\n- **Skill ID**: NET-001\n- **名称（LLM 调用）**: `net_ping`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `ping -c4`\n\n## 用途\n\nICMP 连通性与丢包/延迟探测。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `target_ip` | 是 | — | 目标 IP 或域名 |\n| `count` | 否 | 4 | 探测次数（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：ping -c4\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注丢包率与 RTT 抖动；被禁 ICMP 时需改用 TCP 探测。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.104493+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-001][感知][L1][免费+] ICMP 连通性与丢包/延迟探测。 触发场景：net ping、ping -c4。对应命令/接口：ping -c4。",
+      "id": "6c13e107-fec0-4460-8c94-754ed02058f3",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_ping",
+      "updatedAt": "2026-09-24T15:55:29.681245+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_measure_latency\ndescription: '[NET-010][感知][L1][免费+] 多次探测测量延迟分布（min/avg/max/mdev）。 触发场景：net measure latency、ping -c10。对应命令/接口：ping -c10。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_measure_latency · 感知\n\n- **Skill ID**: NET-010\n- **名称（LLM 调用）**: `net_measure_latency`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `ping -c10`\n\n## 用途\n\n多次探测测量延迟分布（min/avg/max/mdev）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `target_ip` | 是 | — | 目标 IP 或域名 |\n| `count` | 否 | 10 | 探测次数（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：ping -c10\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 结合业务 SLA 判断是否达标；抖动比均值更值得关注。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.099725+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-010][感知][L1][免费+] 多次探测测量延迟分布（min/avg/max/mdev）。 触发场景：net measure latency、ping -c10。对应命令/接口：ping -c10。",
+      "id": "0854762e-2abd-4a3f-927f-2d5f80b080f1",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_measure_latency",
+      "updatedAt": "2026-09-24T15:55:29.675736+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_get_vpc_info\ndescription: '[NET-007][感知][L1][免费+] 查询 VPC 基本信息与网段。 触发场景：net get vpc info、VPC SDK Describe。对应命令/接口：VPC SDK Describe。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_get_vpc_info · 感知\n\n- **Skill ID**: NET-007\n- **名称（LLM 调用）**: `net_get_vpc_info`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `VPC SDK Describe`\n\n## 用途\n\n查询 VPC 基本信息与网段。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `vpc_id` | 是 | — | VPC ID |\n| `region` | 是 | — | 云区域（如 cn-north-4） |\n\n## 执行\n\n```bash\n# 对应命令/接口：VPC SDK Describe\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 确认 VPC 网段与对端是否存在重叠（影响对等连接/VPN）。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.091418+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-007][感知][L1][免费+] 查询 VPC 基本信息与网段。 触发场景：net get vpc info、VPC SDK Describe。对应命令/接口：VPC SDK Describe。",
+      "id": "5acf28db-b32a-4c9f-b608-5029d3b7bb90",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_get_vpc_info",
+      "updatedAt": "2026-09-24T15:55:29.667893+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_get_subnet_info\ndescription: '[NET-008][感知][L1][免费+] 查询子网信息与可用 IP 数量。 触发场景：net get subnet info、VPC SDK Describe。对应命令/接口：VPC SDK Describe。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_get_subnet_info · 感知\n\n- **Skill ID**: NET-008\n- **名称（LLM 调用）**: `net_get_subnet_info`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `VPC SDK Describe`\n\n## 用途\n\n查询子网信息与可用 IP 数量。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `subnet_id` | 是 | — | 子网 ID |\n| `region` | 是 | — | 云区域（如 cn-north-4） |\n\n## 执行\n\n```bash\n# 对应命令/接口：VPC SDK Describe\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注剩余可用 IP；耗尽会导致新建实例失败。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.082246+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-008][感知][L1][免费+] 查询子网信息与可用 IP 数量。 触发场景：net get subnet info、VPC SDK Describe。对应命令/接口：VPC SDK Describe。",
+      "id": "5cd2684b-76e5-481a-837b-af205e491a3a",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_get_subnet_info",
+      "updatedAt": "2026-09-24T15:55:29.661489+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_get_security_groups\ndescription: '[NET-005][感知][L1][免费+] 查询实例关联的安全组及规则。 触发场景：net get security groups、VPC SDK Describe。对应命令/接口：VPC SDK Describe。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_get_security_groups · 感知\n\n- **Skill ID**: NET-005\n- **名称（LLM 调用）**: `net_get_security_groups`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `VPC SDK Describe`\n\n## 用途\n\n查询实例关联的安全组及规则。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `region` | 是 | — | 云区域（如 cn-north-4） |\n\n## 执行\n\n```bash\n# 对应命令/接口：VPC SDK Describe\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注入方向规则的源网段与端口范围是否过宽。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.07424+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-005][感知][L1][免费+] 查询实例关联的安全组及规则。 触发场景：net get security groups、VPC SDK Describe。对应命令/接口：VPC SDK Describe。",
+      "id": "e29f3975-0274-4b33-a85c-5e3a2034298d",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_get_security_groups",
+      "updatedAt": "2026-09-24T15:55:29.653225+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_get_load_balancers\ndescription: '[NET-006][感知][L1][免费+] 查询负载均衡实例、监听器与后端组。 触发场景：net get load balancers、LB SDK Describe。对应命令/接口：LB SDK Describe。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_get_load_balancers · 感知\n\n- **Skill ID**: NET-006\n- **名称（LLM 调用）**: `net_get_load_balancers`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `LB SDK Describe`\n\n## 用途\n\n查询负载均衡实例、监听器与后端组。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 实例 ID（由队长或用户提供） |\n| `region` | 是 | — | 云区域（如 cn-north-4） |\n\n## 执行\n\n```bash\n# 对应命令/接口：LB SDK Describe\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 关注后端健康状态与权重配置。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.067476+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-006][感知][L1][免费+] 查询负载均衡实例、监听器与后端组。 触发场景：net get load balancers、LB SDK Describe。对应命令/接口：LB SDK Describe。",
+      "id": "674c0b37-5976-42ac-b0a2-409bef235cd0",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_get_load_balancers",
+      "updatedAt": "2026-09-24T15:55:29.644275+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_check_port\ndescription: '[NET-003][感知][L1][免费+] 探测目标端口是否可达（TCP/UDP）。 触发场景：net check port、telnet / nc。对应命令/接口：telnet / nc。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_check_port · 感知\n\n- **Skill ID**: NET-003\n- **名称（LLM 调用）**: `net_check_port`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `telnet / nc`\n\n## 用途\n\n探测目标端口是否可达（TCP/UDP）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `target_ip` | 是 | — | 目标 IP 或域名 |\n| `port` | 是 | — | 端口号（整数） |\n| `protocol` | 否 | tcp | 协议：tcp / udp / icmp |\n\n## 执行\n\n```bash\n# 对应命令/接口：telnet / nc\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 区分「端口不通」与「安全组拦截」；结合安全组规则取证。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.062542+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-003][感知][L1][免费+] 探测目标端口是否可达（TCP/UDP）。 触发场景：net check port、telnet / nc。对应命令/接口：telnet / nc。",
+      "id": "a461d630-f4fb-42b2-8603-8198005345bc",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_check_port",
+      "updatedAt": "2026-09-24T15:55:29.633912+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: net_check_connectivity\ndescription: '[NET-009][感知][L1][免费+] 端到端连通性综合检测（路由 + 端口 + 安全组）。 触发场景：net check connectivity、综合连通性检测。对应命令/接口：综合连通性检测。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# net_check_connectivity · 感知\n\n- **Skill ID**: NET-009\n- **名称（LLM 调用）**: `net_check_connectivity`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `综合连通性检测`\n\n## 用途\n\n端到端连通性综合检测（路由 + 端口 + 安全组）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `source_ip` | 是 | — | 源 IP |\n| `target_ip` | 是 | — | 目标 IP 或域名 |\n| `port` | 是 | — | 端口号（整数） |\n\n## 执行\n\n```bash\n# 对应命令/接口：综合连通性检测\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 分层结论：本机路由 → 网络 ACL → 安全组 → 目标端口监听。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.055801+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[NET-009][感知][L1][免费+] 端到端连通性综合检测（路由 + 端口 + 安全组）。 触发场景：net check connectivity、综合连通性检测。对应命令/接口：综合连通性检测。",
+      "id": "64eccb97-4ddf-479b-b5e9-1847a0d39ebc",
+      "labels": [
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "ba1a0490-bb1f-4281-8537-a9db108be897",
+          "name": "net",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "net_check_connectivity",
+      "updatedAt": "2026-09-24T15:55:29.627722+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: kafka_list_topics\ndescription: '[MW-009][感知][L1][免费+] 列出集群全部 topic。 触发场景：kafka list topics、kafka-topics --list。对应命令/接口：kafka-topics --list。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_list_topics · 感知\n\n- **Skill ID**: MW-009\n- **名称（LLM 调用）**: `kafka_list_topics`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-topics --list`\n\n## 用途\n\n列出集群全部 topic。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-topics --list\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 用于盘点与命名规范核查。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.047361+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-009][感知][L1][免费+] 列出集群全部 topic。 触发场景：kafka list topics、kafka-topics --list。对应命令/接口：kafka-topics --list。",
+      "id": "abac6001-899b-4832-9d7d-d35fde1c210d",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "4a536d37-44e1-4e14-aff5-f1dd2367ee7f",
+          "name": "kafka",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "kafka_list_topics",
+      "updatedAt": "2026-09-24T15:55:29.616774+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: kafka_get_lag\ndescription: '[MW-008][感知][L1][免费+] 查询指定消费组在指定 topic 上的消费堆积（Lag）。 触发场景：kafka get lag、kafka-consumer-groups。对应命令/接口：kafka-consumer-groups。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_get_lag · 感知\n\n- **Skill ID**: MW-008\n- **名称（LLM 调用）**: `kafka_get_lag`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-consumer-groups`\n\n## 用途\n\n查询指定消费组在指定 topic 上的消费堆积（Lag）。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n| `topic` | 是 | — | Kafka topic 名称 |\n| `group` | 是 | — | Kafka 消费组（consumer group）名称 |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-consumer-groups\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 同时关注 LAG、CURRENT-OFFSET 增速与是否有成员离线。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.043829+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-008][感知][L1][免费+] 查询指定消费组在指定 topic 上的消费堆积（Lag）。 触发场景：kafka get lag、kafka-consumer-groups。对应命令/接口：kafka-consumer-groups。",
+      "id": "63d6ef61-f72f-47fe-90ae-7ed310f40460",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "4a536d37-44e1-4e14-aff5-f1dd2367ee7f",
+          "name": "kafka",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "kafka_get_lag",
+      "updatedAt": "2026-09-24T15:55:29.612728+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: kafka_get_consumer_groups\ndescription: '[MW-012][感知][L1][免费+] 列出全部消费组。 触发场景：kafka get consumer groups、kafka-consumer-groups --list。对应命令/接口：kafka-consumer-groups --list。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_get_consumer_groups · 感知\n\n- **Skill ID**: MW-012\n- **名称（LLM 调用）**: `kafka_get_consumer_groups`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-consumer-groups --list`\n\n## 用途\n\n列出全部消费组。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-consumer-groups --list\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 用于盘点消费方与定位异常消费组。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.037434+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-012][感知][L1][免费+] 列出全部消费组。 触发场景：kafka get consumer groups、kafka-consumer-groups --list。对应命令/接口：kafka-consumer-groups --list。",
+      "id": "33666f23-2c59-4863-abef-b1ef6f55f0e6",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "4a536d37-44e1-4e14-aff5-f1dd2367ee7f",
+          "name": "kafka",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "kafka_get_consumer_groups",
+      "updatedAt": "2026-09-24T15:55:29.609237+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: kafka_get_brokers\ndescription: '[MW-011][感知][L1][免费+] 获取 broker 列表与 API 版本，确认集群成员与协议兼容性。 触发场景：kafka get brokers、kafka-broker-api-versions。对应命令/接口：kafka-broker-api-versions。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_get_brokers · 感知\n\n- **Skill ID**: MW-011\n- **名称（LLM 调用）**: `kafka_get_brokers`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-broker-api-versions`\n\n## 用途\n\n获取 broker 列表与 API 版本，确认集群成员与协议兼容性。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-broker-api-versions\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 结合 controller 信息判断集群是否稳定。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.029611+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-011][感知][L1][免费+] 获取 broker 列表与 API 版本，确认集群成员与协议兼容性。 触发场景：kafka get brokers、kafka-broker-api-versions。对应命令/接口：kafka-broker-api-versions。",
+      "id": "6e2bff0f-6da5-4bad-b438-a2f7e052c683",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "4a536d37-44e1-4e14-aff5-f1dd2367ee7f",
+          "name": "kafka",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "kafka_get_brokers",
+      "updatedAt": "2026-09-24T15:55:29.603584+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: kafka_describe_topic\ndescription: '[MW-010][感知][L1][免费+] 查看 topic 的分区、副本、ISR 与配置项。 触发场景：kafka describe topic、kafka-topics --describe。对应命令/接口：kafka-topics --describe。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_describe_topic · 感知\n\n- **Skill ID**: MW-010\n- **名称（LLM 调用）**: `kafka_describe_topic`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-topics --describe`\n\n## 用途\n\n查看 topic 的分区、副本、ISR 与配置项。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n| `topic` | 是 | — | Kafka topic 名称 |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-topics --describe\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- ISR 少于副本数说明有副本同步落后。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.023271+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-010][感知][L1][免费+] 查看 topic 的分区、副本、ISR 与配置项。 触发场景：kafka describe topic、kafka-topics --describe。对应命令/接口：kafka-topics --describe。",
+      "id": "cc7c4068-fcb9-42c1-86df-e5f92f0bbd15",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "4a536d37-44e1-4e14-aff5-f1dd2367ee7f",
+          "name": "kafka",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "kafka_describe_topic",
+      "updatedAt": "2026-09-24T15:55:29.595488+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    },
+    {
+      "builtin": false,
+      "config": null,
+      "content": "---\nname: kafka_describe_group\ndescription: '[MW-013][感知][L1][免费+] 查看消费组各分区消费进度、Lag 与成员分配。 触发场景：kafka describe group、kafka-consumer-groups --describe。对应命令/接口：kafka-consumer-groups --describe。'\nuser-invocable: \"\"\nallowed-tools: \"\"\nfeatures: []\ncapabilities: []\n---\n\n# kafka_describe_group · 感知\n\n- **Skill ID**: MW-013\n- **名称（LLM 调用）**: `kafka_describe_group`\n- **类别**: 感知\n- **风险等级**: L1\n- **所需订阅包**: 免费+\n- **输出格式**: JSON\n- **对应命令/接口**: `kafka-consumer-groups --describe`\n\n## 用途\n\n查看消费组各分区消费进度、Lag 与成员分配。\n\n## 输入参数\n\n| 参数 | 必填 | 默认 | 说明 |\n|------|------|------|------|\n| `instance_id` | 是 | — | 中间件实例 ID（由队长或用户提供） |\n| `group` | 是 | — | Kafka 消费组（consumer group）名称 |\n\n## 执行\n\n```bash\n# 对应命令/接口：kafka-consumer-groups --describe\n```\n\n## 输出\n\n以 **JSON** 返回，包含原始输出与结构化字段，便于证据链引用。\n\n## 风险与授权\n\n只读感知，无需审批。\n\n## 校验与判读要点\n\n- 重点看分区倾斜与 STABLE 状态。\n- 结论必须可追溯：记录调用的 skill、参数与原始输出。\n- 标识类参数（instance_id / topic / group / index_name）缺失时先确认，不得猜测。\n\n## 语言约定\n\n对用户输出使用**简体中文**；命令、参数与字段名保持**英文**。\n",
+      "createdAt": "2026-09-24T15:41:57.014583+08:00",
+      "createdBy": "a0000000-0000-0000-0000-000000000002",
+      "description": "[MW-013][感知][L1][免费+] 查看消费组各分区消费进度、Lag 与成员分配。 触发场景：kafka describe group、kafka-consumer-groups --describe。对应命令/接口：kafka-consumer-groups --describe。",
+      "id": "9648e034-be32-4c3f-bd7e-53d2af561bee",
+      "labels": [
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "4a536d37-44e1-4e14-aff5-f1dd2367ee7f",
+          "name": "kafka",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#034cdd",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "5c9f2dd8-bfa8-4b16-9f95-0f0d23e329ba",
+          "name": "L1",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#6b7280",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "8fa89e64-4983-4596-8b63-e10f821128bc",
+          "name": "感知",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        },
+        {
+          "color": "#245fd6",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "id": "1fdb36e5-34bb-4851-bcdf-78829d6d894f",
+          "name": "社区版",
+          "resourceType": 2,
+          "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+        }
+      ],
+      "name": "kafka_describe_group",
+      "updatedAt": "2026-09-24T15:55:29.586729+08:00",
+      "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0"
+    }
+  ],
+  "page": 1,
+  "perPage": 50,
+  "total": 54,
+  "totalPages": 2,
+  "hasMore": true
+}
