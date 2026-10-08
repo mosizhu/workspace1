@@ -1,0 +1,140 @@
+[
+  {
+    "id": "e2d64fe2-d74c-4405-a67b-09a915dcd27b",
+    "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0",
+    "ownerId": "a0000000-0000-0000-0000-000000000002",
+    "name": "【TiDB数据库每日巡检】",
+    "description": "",
+    "goal": "不需要创建工单\n\n1.使用swissql connections list --db-type tidb --isolation-domain 89a24b82-a9e5-4d8b-b091-a64b3989ccd0 -o json列出所有的TiDB类型数据库\n\n2.对上面所有的数据库进行巡检\n\n3.存在异常告警项时，将结果post 到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6f41b03b-3596-475b-8cb6-1f7ffcdce8fb",
+    "triggerType": 0,
+    "triggerTypeName": "schedule",
+    "actionType": 1,
+    "actionTypeName": "assign_agent",
+    "actionConfig": {
+      "agentId": "8d2f000a-556b-466d-839c-8b444a14eea5",
+      "notifyUserIds": [
+        "a0000000-0000-0000-0000-000000000002"
+      ]
+    },
+    "enabled": true,
+    "lastRunAt": "2026-10-08T12:03:25.484439+08:00",
+    "nextRunAt": null,
+    "createdAt": "2026-10-08T11:56:17.119213+08:00",
+    "updatedAt": "2026-10-08T14:09:39.997047+08:00"
+  },
+  {
+    "id": "1df1cfdb-a0df-40ee-8ba4-67a2208d2f33",
+    "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0",
+    "ownerId": "a0000000-0000-0000-0000-000000000002",
+    "name": "【DM数据库每日巡检】",
+    "description": "",
+    "goal": "不需要创建工单\n\n1.使用swissql connections list --db-type dm --isolation-domain 89a24b82-a9e5-4d8b-b091-a64b3989ccd0 -o json列出所有的达梦类型数据库\n\n2.对上面所有的数据库进行巡检\n\n3.存在异常告警项时，将结果post 到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6f41b03b-3596-475b-8cb6-1f7ffcdce8fb",
+    "triggerType": 0,
+    "triggerTypeName": "schedule",
+    "actionType": 1,
+    "actionTypeName": "assign_agent",
+    "actionConfig": {
+      "agentId": "b67ee572-f83b-435d-9730-46bf3967d470",
+      "notifyUserIds": [
+        "a0000000-0000-0000-0000-000000000002"
+      ]
+    },
+    "enabled": true,
+    "lastRunAt": "2026-10-08T12:39:14.930484+08:00",
+    "nextRunAt": null,
+    "createdAt": "2026-10-08T11:18:28.274713+08:00",
+    "updatedAt": "2026-10-08T14:09:33.212445+08:00"
+  },
+  {
+    "id": "81ca33ef-bf51-4e9c-a9d1-162ee7835a1b",
+    "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0",
+    "ownerId": "03e2d134-5729-4a4e-a0e4-c6623c9c09b8",
+    "name": "【vpn状态检查】",
+    "description": "",
+    "goal": "执行 ssh [root@192.168.1.190](mailto:root@192.168.1.190)   \"ps -ef | grep openconnect | grep -v grep | wc -l\"\n\n若返回结果为0，则vpn已断开，执行ssh ssh [root@192.168.1.190](mailto:root@192.168.1.190) \"/root/.vpn/start-openconnect.sh\"\n\n若返回结果不为0，则表示vpn连接正常，无需任何操作。\n\n\n\n\u0026nbsp;",
+    "triggerType": 0,
+    "triggerTypeName": "schedule",
+    "actionType": 1,
+    "actionTypeName": "assign_agent",
+    "actionConfig": {
+      "agentId": "70db6ee4-32a6-46b3-8fa3-41d8f76252d5",
+      "notifyUserIds": [
+        "03e2d134-5729-4a4e-a0e4-c6623c9c09b8"
+      ]
+    },
+    "enabled": true,
+    "lastRunAt": "2026-10-08T10:18:27.925861+08:00",
+    "nextRunAt": null,
+    "createdAt": "2026-10-08T09:35:59.569063+08:00",
+    "updatedAt": "2026-10-08T11:10:18.411814+08:00"
+  },
+  {
+    "id": "92aea1cf-ed51-4161-957b-27ae242ed150",
+    "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0",
+    "ownerId": "a0000000-0000-0000-0000-000000000002",
+    "name": "【MySQL数据库每日巡检】",
+    "description": "",
+    "goal": "不需要创建工单\n\n1.使用swissql connections list --db-type mysql --isolation-domain 89a24b82-a9e5-4d8b-b091-a64b3989ccd0 -o json列出所有的mysql类型数据库\n\n2.对上面查到的所有mysql数据库进行巡检\n\n3.存在异常告警项时，将结果post 到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6f41b03b-3596-475b-8cb6-1f7ffcdce8fb",
+    "triggerType": 0,
+    "triggerTypeName": "schedule",
+    "actionType": 1,
+    "actionTypeName": "assign_agent",
+    "actionConfig": {
+      "agentId": "4ef58737-a57d-4837-b399-d2797f8780b4",
+      "notifyUserIds": [
+        "a0000000-0000-0000-0000-000000000002"
+      ]
+    },
+    "enabled": true,
+    "lastRunAt": "2026-10-08T10:55:54.11581+08:00",
+    "nextRunAt": null,
+    "createdAt": "2026-09-24T17:54:43.772795+08:00",
+    "updatedAt": "2026-10-08T14:09:27.125554+08:00"
+  },
+  {
+    "id": "49cb056b-e625-4e33-a6a0-0d8d1f62f4a0",
+    "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0",
+    "ownerId": "a0000000-0000-0000-0000-000000000002",
+    "name": "【数据库连通性每日巡检】",
+    "description": "",
+    "goal": "按以下流程执行巡检:\n\n1. 运行 swissql connections list --isolation-domain 89a24b82-a9e5-4d8b-b091-a64b3989ccd0 -o json,获取全部数据库连接(应为 22 条)\n2. 逐条运行 swissql connections test \u003cprofile_id\u003e --isolation-domain 89a24b82-a9e5-4d8b-b091-a64b3989ccd0,记录每条的通过/失败与失败原因\n3. 全部通过:输出简短晨检报告(总数/通过数/耗时),不创建工单\n4. 存在失败时，将结果 post 到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6f41b03b-3596-475b-8cb6-1f7ffcdce8fb  \n─ 连接完全不可达(超时/连接拒绝/Connection refused) → priority=urgent(枚举值 2)  \n─ 连接通但业务异常(如 auth 失败/账号密码错误)        → priority=high(枚举值 1)  \n─ 其它失败(如驱动异常/协议不匹配)                    → priority=high(枚举值 1)",
+    "triggerType": 0,
+    "triggerTypeName": "schedule",
+    "actionType": 1,
+    "actionTypeName": "assign_agent",
+    "actionConfig": {
+      "agentId": "70db6ee4-32a6-46b3-8fa3-41d8f76252d5",
+      "notifyUserIds": [
+        "a0000000-0000-0000-0000-000000000002"
+      ]
+    },
+    "enabled": true,
+    "lastRunAt": "2026-10-08T11:32:20.529893+08:00",
+    "nextRunAt": null,
+    "createdAt": "2026-09-24T17:10:01.537343+08:00",
+    "updatedAt": "2026-10-08T14:09:12.947523+08:00"
+  },
+  {
+    "id": "b240c750-e2b8-4321-894e-50b6cbe3a652",
+    "workspaceId": "89a24b82-a9e5-4d8b-b091-a64b3989ccd0",
+    "ownerId": "a0000000-0000-0000-0000-000000000002",
+    "name": "【Oracle数据库每日巡检】",
+    "description": "",
+    "goal": "不需要创建工单\n\n1.使用swissql connections list --db-type oracle --isolation-domain 89a24b82-a9e5-4d8b-b091-a64b3989ccd0 -o json列出所有的oracle类型数据库\n\n2.对上面所有的数据库进行巡检\n\n3.存在异常告警项时，将结果post 到 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6f41b03b-3596-475b-8cb6-1f7ffcdce8fb",
+    "triggerType": 0,
+    "triggerTypeName": "schedule",
+    "actionType": 1,
+    "actionTypeName": "assign_agent",
+    "actionConfig": {
+      "agentId": "3628b335-cd72-4a33-88da-ef506d6801d9",
+      "notifyUserIds": [
+        "a0000000-0000-0000-0000-000000000002"
+      ]
+    },
+    "enabled": true,
+    "lastRunAt": "2026-10-08T12:39:25.167463+08:00",
+    "nextRunAt": null,
+    "createdAt": "2026-09-24T16:37:28.095876+08:00",
+    "updatedAt": "2026-10-08T14:09:05.285737+08:00"
+  }
+]
