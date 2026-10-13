@@ -1,0 +1,1 @@
+{"mcpServers":{"kev":{"env":{"KEV_KEY":"localkey","KEV_URL":"http://192.168.1.130:8009"},"args":["run","--directory","/home/cola/mcp/kev-mcp","python","server.py"],"type":"stdio","command":"uv"}}}

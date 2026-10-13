@@ -1,0 +1,325 @@
+# ==============================================================================
+# Mopheus IT Asset Manifest Template
+# Version: mopheus.io/v1alpha1
+#
+# NOTE FOR AI AGENTS:
+# This manifest is machine-synthesized by AI agents. Do NOT attempt to handcraft
+# without inspecting the TBox metamodel schemas via:
+#   mop asset concept get <ConceptName>
+# Every attribute under 'attributes' is strictly validated against the concept JSONSchema.
+# Every predicate under 'relations' must adhere to the concept's allowed_relations axioms.
+# ==============================================================================
+
+version: mopheus.io/v1alpha1
+kind: AssetManifest
+metadata:
+  workspace: my-workspace-slug-or-id
+  environment: prod
+
+assets:
+  # ----------------------------------------------------------------------------
+  # 1. Business Layer: Application (Top-level enterprise business system)
+  # Constraints: No required attributes; additionalProperties: false
+  # ----------------------------------------------------------------------------
+  - id: app:mall-core
+    concept: Application
+    name: "Mall Core Platform"
+    aliases:
+      - "mall"
+      - "ecommerce-core"
+    status: active
+    environment: prod
+    attributes: {}
+    labels:
+      owner_team: "mall-arch"
+      tier: "P0"
+      department: "Retail E-Commerce"
+
+  # ----------------------------------------------------------------------------
+  # 2. Business Layer: Service (Deployable microservice component)
+  # Optional attributes: codebase_repo (string)
+  # ----------------------------------------------------------------------------
+  - id: svc:order-api
+    concept: Service
+    name: "Order API Service"
+    aliases:
+      - "order-gw"
+      - "order-service"
+    status: active
+    environment: prod
+    attributes:
+      codebase_repo: "https://github.com/example/order-api"
+    labels:
+      owner_team: "order-dev"
+      tier: "P0"
+      oncall: "alice"
+
+  # ----------------------------------------------------------------------------
+  # 3. Compute Layer: Host (Bare-metal server, virtual machine, or cloud ECS)
+  # Required attributes: management_ip (string)
+  # Optional attributes: role (worker|control_plane|gateway|standalone), ips ([]string),
+  #                      zone (string), rack (string), credential_ref (string), machine_id (string)
+  # Note: credential_ref format: ssh://[user@]hostname[:port][?key=<keyName>]
+  # ----------------------------------------------------------------------------
+  - id: host:k8s-worker-01
+    concept: Host
+    name: "K8s Worker Node 01"
+    aliases:
+      - "worker-01"
+      - "10.0.1.10"
+    status: active
+    environment: prod
+    attributes:
+      management_ip: "10.0.1.10"
+      ips:
+        - "10.0.1.10"
+        - "192.168.10.10"
+      role: "worker"
+      zone: "zone-a"
+      rack: "rack-01"
+      # SSH credential reference: binds remote user and key generated via 'mop user config-file generate-ssh-key'
+      credential_ref: "ssh://ops@10.0.1.10:22?key=infra-key"
+      # machine_id: matches /etc/machine-id for agent local machine short-circuit optimization
+      machine_id: "a1b2c3d4e5f6789012345678abcdef01"
+    labels:
+      owner_team: "infra-ops"
+      tier: "P0"
+      oncall: "bob"
+
+  - id: host:db-server-01
+    concept: Host
+    name: "Database Physical Host 01"
+    aliases:
+      - "db-host-01"
+      - "10.0.2.11"
+    status: active
+    environment: prod
+    attributes:
+      management_ip: "10.0.2.11"
+      role: "standalone"
+      zone: "zone-a"
+      rack: "rack-02"
+      credential_ref: "ssh://root@10.0.2.11:22?key=db-admin-key"
+      machine_id: "b2c3d4e5f6789012345678abcdef01a2"
+    labels:
+      owner_team: "dba-team"
+      tier: "P0"
+
+  # ----------------------------------------------------------------------------
+  # 4. Platform Layer: Cluster (High-availability clustering and consensus control plane)
+  # Required attributes: cluster_type (oracle_crs|k8s_control_plane|pacemaker|patroni_etcd|keepalived_vrrp)
+  # Optional attributes: api_endpoint (string), credential_ref (string), machine_id (string)
+  # ----------------------------------------------------------------------------
+  - id: cluster:k8s-prod
+    concept: Cluster
+    name: "Production Kubernetes Control Plane"
+    aliases:
+      - "k8s-prod"
+    status: active
+    environment: prod
+    attributes:
+      cluster_type: "k8s_control_plane"
+      api_endpoint: "https://10.0.1.1:6443"
+    labels:
+      owner_team: "k8s-sre"
+      tier: "P0"
+
+  # ----------------------------------------------------------------------------
+  # 5. Platform Layer: Container (Single container instance or Kubernetes Pod)
+  # Constraints: additionalProperties: false
+  # ----------------------------------------------------------------------------
+  - id: container:order-api-pod-1
+    concept: Container
+    name: "order-api-7b8f99-x7kz"
+    aliases:
+      - "order-api-pod-1"
+    status: active
+    environment: prod
+    attributes: {}
+    labels:
+      app: "order-api"
+
+  # ----------------------------------------------------------------------------
+  # 6. Database Layer: Database (Logical database cluster or stateful data service)
+  # Required attributes: engine (string, e.g. postgresql|mysql|oracle|tidb|redis|elasticsearch|mogdb|yashandb),
+  #                      db_mode (single|cluster|distributed|primary_standby|rac)
+  # Optional attributes: version (string), credential_ref (string), machine_id (string)
+  # ----------------------------------------------------------------------------
+  - id: db:order-postgres
+    concept: Database
+    name: "Order PostgreSQL HA Cluster"
+    aliases:
+      - "order-pg"
+      - "order-db"
+    status: active
+    environment: prod
+    attributes:
+      engine: "postgresql"
+      db_mode: "cluster"
+      version: "16.2"
+    labels:
+      owner_team: "dba-team"
+      tier: "P0"
+
+  # ----------------------------------------------------------------------------
+  # 7. Database Layer: DatabaseInstance (Single database or cache process instance)
+  # Required attributes: port (1-65535)
+  # Optional attributes: ip (string), role (primary|standby|read_replica|witness),
+  #                      instance_name (string), credential_ref (string, e.g. swissql://<profile-id> or ssh://...), machine_id (string)
+  # ----------------------------------------------------------------------------
+  - id: dbi:order-pg-primary
+    concept: DatabaseInstance
+    name: "Order PG Primary Instance"
+    aliases:
+      - "pg-primary"
+    status: active
+    environment: prod
+    attributes:
+      ip: "10.0.2.11"
+      port: 5432
+      role: "primary"
+      instance_name: "order_master"
+      credential_ref: "ssh://postgres@10.0.2.11:22?key=db-admin-key"
+    labels:
+      owner_team: "dba-team"
+
+  # ----------------------------------------------------------------------------
+  # 8. Network Layer: VirtualIP (High-availability Virtual IP, Floating IP, or SCAN IP)
+  # Required attributes: ip (string), role (vip|scan|floating)
+  # ----------------------------------------------------------------------------
+  - id: vip:order-db-vip
+    concept: VirtualIP
+    name: "Order DB Virtual IP"
+    aliases:
+      - "pg-vip"
+    status: active
+    environment: prod
+    attributes:
+      ip: "10.0.2.10"
+      role: "vip"
+    labels:
+      owner_team: "dba-team"
+
+  # ----------------------------------------------------------------------------
+  # 9. Network Layer: LoadBalancer (Hardware/software load balancer or API gateway)
+  # Required attributes: lb_type (nginx|haproxy|f5|cloud_slb|envoy|apisix|kong|k8s_ingress)
+  # Optional attributes: ip (string), ports ([]integer)
+  # ----------------------------------------------------------------------------
+  - id: lb:mall-ingress
+    concept: LoadBalancer
+    name: "Mall External Ingress Gateway"
+    aliases:
+      - "mall-gw"
+    status: active
+    environment: prod
+    attributes:
+      lb_type: "k8s_ingress"
+      ip: "10.0.1.200"
+      ports:
+        - 80
+        - 443
+    labels:
+      owner_team: "infra-ops"
+
+  # ----------------------------------------------------------------------------
+  # 10. Network Layer: DNSRecord (Domain name resolution record)
+  # Required attributes: domain (string), record_type (A|CNAME|AAAA|PTR)
+  # ----------------------------------------------------------------------------
+  - id: dns:mall-api-domain
+    concept: DNSRecord
+    name: "api.mall.example.com"
+    aliases:
+      - "mall-domain"
+    status: active
+    environment: prod
+    attributes:
+      domain: "api.mall.example.com"
+      record_type: "A"
+    labels:
+      owner_team: "infra-ops"
+
+  # ----------------------------------------------------------------------------
+  # 11. Middleware Layer: MessageQueue (Message broker cluster or standalone service)
+  # Required attributes: mq_type (kafka|rocketmq|rabbitmq|emqx|pulsar)
+  # Optional attributes: endpoints ([]string), version (string)
+  # ----------------------------------------------------------------------------
+  - id: mq:event-kafka
+    concept: MessageQueue
+    name: "Order Event Kafka Cluster"
+    aliases:
+      - "order-kafka"
+    status: active
+    environment: prod
+    attributes:
+      mq_type: "kafka"
+      endpoints:
+        - "10.0.3.1:9092"
+        - "10.0.3.2:9092"
+        - "10.0.3.3:9092"
+      version: "3.6.0"
+    labels:
+      owner_team: "middleware-ops"
+
+# ==============================================================================
+# Topology Relationships (Relations)
+# Canonical Predicates:
+#   - contains: Structural encapsulation (Subject contains Object)
+#   - runs_on: Physical or logical hosting (Subject runs on Object)
+#   - routes_to: Network routing and traffic forwarding (Subject routes traffic to Object)
+#   - depends_on: Runtime operational/functional dependency (Subject depends on Object)
+#   - replicates_to: Stateful replication and sync (Subject replicates data to Object)
+#   - clustered_with: Peer-to-peer HA pairing (Subject is clustered with Object)
+#   - manages: Control plane orchestration and governance (Subject manages Object)
+# ==============================================================================
+relations:
+  # 1. Structural Containment (contains)
+  - subject: app:mall-core
+    predicate: contains
+    object: svc:order-api
+
+  - subject: db:order-postgres
+    predicate: contains
+    object: dbi:order-pg-primary
+
+  - subject: cluster:k8s-prod
+    predicate: contains
+    object: host:k8s-worker-01
+
+  # 2. Hosting & Execution (runs_on)
+  - subject: container:order-api-pod-1
+    predicate: runs_on
+    object: host:k8s-worker-01
+
+  - subject: svc:order-api
+    predicate: runs_on
+    object: host:k8s-worker-01
+
+  - subject: dbi:order-pg-primary
+    predicate: runs_on
+    object: host:db-server-01
+
+  - subject: vip:order-db-vip
+    predicate: runs_on
+    object: host:db-server-01
+
+  # 3. Traffic Routing (routes_to)
+  - subject: dns:mall-api-domain
+    predicate: routes_to
+    object: lb:mall-ingress
+
+  - subject: lb:mall-ingress
+    predicate: routes_to
+    object: svc:order-api
+
+  - subject: vip:order-db-vip
+    predicate: routes_to
+    object: dbi:order-pg-primary
+
+  # 4. Dependency (depends_on)
+  - subject: svc:order-api
+    predicate: depends_on
+    object: db:order-postgres
+
+  - subject: svc:order-api
+    predicate: depends_on
+    object: mq:event-kafka
